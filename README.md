@@ -82,6 +82,15 @@ uv run inference.py "a fox walking in the snow" \
 - [Prompting Guide](docs/prompting.md)
 - [Safety Guide](docs/safety.md)
 
+## Inference
+
+You can run our open source models on the following platforms.
+
+- [ComfyUI](https://github.com/comfy-org/comfyui)
+- [Fal](https://fal.ai/models/fal-ai/krea-2/turbo)
+- [SGLang](https://docs.sglang.io/cookbook/diffusion/Krea/Krea-2)
+
+
 ## Finetuning Krea 2
 
 For finetuning Krea 2, we highly recommend that you **train a LoRA on the Raw model and apply it to the Turbo model** for inference.
