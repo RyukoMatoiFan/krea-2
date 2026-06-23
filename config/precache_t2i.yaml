@@ -1,0 +1,10 @@
+# Precompute latent + text caches for Krea 2 text-to-image fine-tuning.
+#   python precache_t2i.py --config config/precache_t2i.yaml [--limit N] [--no-cache-text]
+# Machine paths (paths.data_root / paths.cache_dir) come from user/local.yaml or KREA2_PATHS__* env.
+data:
+  resolution: 1024
+  img_ext: jpg
+  prebuilt_json: false      # set true to read <name>.json caption sidecars verbatim (grounded JSON)
+  json_suffix: .json
+  aspect_bucketing: false   # true -> nearest-AR bucket instead of square-squash
+  num_buckets: 9

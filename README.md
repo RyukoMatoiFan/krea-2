@@ -94,6 +94,25 @@ We recommend using the following providers and open source tools for finetuning 
   - [Inference](https://fal.ai/models/fal-ai/krea-2/turbo/lora)
 - [Kohya (musubi tuner)]( https://github.com/kohya-ss/musubi-tuner)
 
+## Training (this fork)
+
+A self-contained training stack — **full fine-tune and LoRA** for Krea 2 **RAW** on a single 80 GB GPU. Latents and text are precached, so the loop is encoder-free. Full guide: **[docs/TRAINING.md](docs/TRAINING.md)**.
+
+- **Full fine-tune** of the 12B DiT on one 80 GB H100 (fused per-parameter backward + on-GPU Adafactor + gradient checkpointing + bf16 stochastic rounding).
+- **LoRA** in ComfyUI/ai-toolkit key format — train on RAW, apply on Turbo.
+- Resume, EMA, held-out validation, aspect bucketing; TensorBoard + a live web dashboard (`dashboard.py`).
+
+```bash
+mkdir -p user && cp config/local.example.yaml user/local.yaml         # set data/output paths (user/ is gitignored)
+python precache_t2i.py --config config/precache_t2i.yaml             # cache latents + text
+python train_t2i_full_joint_cached.py --config config/t2i_full.yaml # full fine-tune
+python train_t2i_lora_cached.py       --config config/t2i_lora.yaml # or LoRA
+python sample.py --config config/t2i_lora.yaml \
+  --lora runs/<run>/ckpts/lora_final.safetensors --prompt "a fox walking in the snow" --out fox.png
+```
+
+Needs extras beyond `uv sync` (diffusers ≥0.35 for `AutoencoderKLQwenImage`, tensorboard). Add `--smoke` for a ~20-step sanity run.
+
 ## FAQ
 
 **Which model I should use?**

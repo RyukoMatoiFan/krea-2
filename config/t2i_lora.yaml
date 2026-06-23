@@ -1,0 +1,39 @@
+# LoRA fine-tune (DiT adapters) for Krea 2. Train on Raw, run on Turbo.
+#   CUDA_VISIBLE_DEVICES=0 python train_t2i_lora_cached.py --config config/t2i_lora.yaml [--smoke]
+# Machine paths -> user/local.yaml or KREA2_* env.
+lora:
+  rank: 32
+  alpha: 32                # null -> defaults to rank
+  variant: lora
+  target_txtfusion: false  # also adapt the text-fusion stage Linears
+optim:
+  lr: 1.0e-4
+  steps: 3000
+  batch: 1
+  accum: 1
+  warmup: 50
+  optimizer: adamw         # adamw | adamw8bit | prodigy | schedule_free | came
+  weight_decay: 0.0
+  grad_clip: 1.0
+  grad_checkpointing: true
+  cfg_dropout_prob: 0.1
+  lr_scheduler: cosine
+  min_lr_ratio: 0.1
+data:
+  resolution: 1024
+  n_eval_holdout: 4
+flow:
+  base_shift: 0.5
+  max_shift: 1.15
+  base_image_seq_len: 256
+  max_image_seq_len: 6400
+  sigma: 1.0
+logging:
+  log_every: 25
+  ckpt_every: 500
+  sample_every: 500
+  sample_steps: 28
+  sample_guidance: 4.5
+  sample_count: 4
+  tracker: tensorboard
+  wandb_project: krea2

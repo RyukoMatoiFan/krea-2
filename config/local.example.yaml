@@ -1,0 +1,10 @@
+# Copy to user/local.yaml (the user/ folder is gitignored) and set your machine paths.
+# Deep-merged over any preset. Or override per-run with env vars, e.g. KREA2_PATHS__DATA_ROOT=/data/images.
+paths:
+  data_root: /path/to/images        # folder of training images (+ <name>.txt or <name>.json captions)
+  cache_dir: /path/to/cache         # where precache writes <idx:06d>.pt
+  output_dir: runs/krea2-t2i        # metrics.jsonl, samples/, tensorboard events
+  ckpt_dir: runs/krea2-t2i/ckpts    # safetensors checkpoints (must NOT be under /home or /root)
+runtime:
+  device: cuda
+  hf_offline: false

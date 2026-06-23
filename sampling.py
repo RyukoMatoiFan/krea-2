@@ -73,8 +73,13 @@ def sample(
     y1=0.5,
     y2=1.15,
     mu=None,
+    images=None,
 ):
-    """End-to-end text-to-image sampling: encode -> euler+CFG denoise -> decode."""
+    """End-to-end text-to-image sampling: encode -> euler+CFG denoise -> decode.
+
+    ``images`` (style-reference): one reference image per prompt fed through the VLM encoder so
+    image-derived conditioning enters the text stream; the unconditional CFG branch stays text-only.
+    """
     patch = model.config.patch
 
     # The latent grid (dim // ae.compression) is patchified in `patch`-sized blocks,
@@ -104,8 +109,8 @@ def sample(
         dim=0,
     )
 
-    # Positive (conditional) text conditioning.
-    txt, txtmask = encoder(prompts)
+    # Positive (conditional) text conditioning (+ optional style-reference image).
+    txt, txtmask = encoder(prompts, images=images) if images is not None else encoder(prompts)
     x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
 
     # The unconditional branch is only used for CFG; skip encoding/prep entirely

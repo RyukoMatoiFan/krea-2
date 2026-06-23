@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from einops import rearrange
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -376,6 +377,56 @@ class SingleStreamDiT(nn.Module):
             nn.GELU(approximate="tanh"), nn.Linear(config.features, config.features * 6)
         )
 
+        # Set True by the trainer for full fine-tune memory savings; inference leaves it False.
+        self.gradient_checkpointing = False
+
+        # Block-swap state (configured by enable_block_swap): the deepest blocks live on CPU and
+        # page to the GPU only while in use. Empty set = disabled (zero overhead in forward).
+        self._swap_blocks: set[int] = set()
+        self._swap_device: torch.device | None = None
+        self._swap_skip_trainable = True
+
+    def enable_block_swap(self, num_blocks: int, device, *, skip_trainable: bool = True) -> list[int]:
+        """Offload the ``num_blocks`` deepest transformer blocks to CPU, paging each to ``device``
+        for its forward/backward and back to CPU afterward. Trades DiT-resident VRAM for per-step
+        host<->device copies. Pair with gradient checkpointing: the backward recompute re-pages the
+        block in via the forward pre-hook, so the weights are present exactly when needed.
+
+        ``skip_trainable=True`` (the LoRA path) pages only frozen base weights, keeping trainable
+        params (e.g. LoRA adapters) GPU-resident. ``skip_trainable=False`` pages every param (FFT —
+        correct but slow). Returns the indices marked for swapping.
+        """
+        n = max(0, min(int(num_blocks), len(self.blocks)))
+        self._swap_device = torch.device(device)
+        self._swap_skip_trainable = bool(skip_trainable)
+        self._swap_blocks = set(range(len(self.blocks) - n, len(self.blocks)))
+        for i in self._swap_blocks:
+            block = self.blocks[i]
+            self._swap_move(block, torch.device("cpu"))   # park on CPU now
+            block.register_forward_pre_hook(self._swap_pre_hook)
+        return sorted(self._swap_blocks)
+
+    def _swap_move(self, block: nn.Module, device: torch.device) -> None:
+        skip = self._swap_skip_trainable
+        for p in block.parameters():
+            if skip and p.requires_grad:        # keep trainable params (LoRA adapters) resident
+                continue
+            p.data = p.data.to(device, non_blocking=True)
+
+    def _swap_pre_hook(self, module, args):
+        # Fires for both the real forward and the checkpoint recompute -> weights on GPU when used.
+        self._swap_move(module, self._swap_device)
+
+    def _swap_offload(self, block: nn.Module) -> None:
+        self._swap_move(block, torch.device("cpu"))
+
+    def _mk_post_bwd_offload(self, block: nn.Module):
+        # Tensor hook on a block's input: fires after that block's backward -> safe to page out.
+        def hook(grad):
+            self._swap_offload(block)
+            return None
+        return hook
+
     def forward(
         self,
         img: Tensor,
@@ -408,8 +459,29 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.posemb(pos)
 
-        for block in self.blocks:
-            combined = block(combined, tvec, freqs, mask)
+        swap = self._swap_blocks
+        for i, block in enumerate(self.blocks):
+            swapped = i in swap
+            if self.gradient_checkpointing and self.training:
+                inp = combined
+                combined = torch.utils.checkpoint.checkpoint(
+                    block, inp, tvec, freqs, mask, use_reentrant=False
+                )
+                if swapped:
+                    # Real forward done; the checkpoint recompute re-pages the block in via the
+                    # pre-hook. Page out after the block's backward (hook on its input grad).
+                    self._swap_offload(block)
+                    if inp.requires_grad:
+                        inp.register_hook(self._mk_post_bwd_offload(block))
+            else:
+                inp = combined
+                combined = block(inp, tvec, freqs, mask)
+                if swapped:
+                    if not self.training:
+                        self._swap_offload(block)                 # inference: free immediately
+                    elif inp.requires_grad:
+                        # No recompute here: keep weights resident through backward, free after.
+                        inp.register_hook(self._mk_post_bwd_offload(block))
 
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]

@@ -1,0 +1,36 @@
+# Full fine-tune (DiT [+ Qwen3-VL text encoder]) for Krea 2.
+#   CUDA_VISIBLE_DEVICES=0 python train_t2i_full_joint_cached.py --config config/t2i_full.yaml [--smoke]
+# Machine paths (paths.cache_dir / paths.output_dir / paths.ckpt_dir) -> user/local.yaml or KREA2_* env.
+optim:
+  lr: 1.0e-5
+  te_lr: 0.0               # 0 -> DiT-only when caches hold llm_text; set e.g. 1.0e-6 for joint TE FFT
+  steps: 40000
+  batch: 1
+  accum: 1                 # accum==1 enables the fused per-parameter backward (lowest VRAM)
+  warmup: 200
+  weight_decay: 0.01
+  grad_clip: 1.0
+  grad_checkpointing: true
+  optimizer_state: adafactor   # on-GPU factored 2nd moment -> fits the 12B DiT on one 80GB GPU
+  cfg_dropout_prob: 0.1
+  lr_scheduler: cosine
+  min_lr_ratio: 0.1
+data:
+  resolution: 1024
+  n_eval_holdout: 4
+flow:
+  base_shift: 0.5
+  max_shift: 1.15
+  base_image_seq_len: 256
+  max_image_seq_len: 6400
+  sigma: 1.0
+  timestep_weighting: uniform
+logging:
+  log_every: 25
+  ckpt_every: 1000
+  sample_every: 1000
+  sample_steps: 28
+  sample_guidance: 4.5
+  sample_count: 4
+  tracker: tensorboard
+  wandb_project: krea2

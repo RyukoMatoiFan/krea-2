@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .hf_home
 .DS_Store
+
+user/
