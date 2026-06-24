@@ -121,6 +121,7 @@ def main():
     print(f"[slider] {len(adapters)} adapters, {sum(p.numel() for p in params)/1e6:.1f}M params", flush=True)
     gen = torch.Generator(device=device).manual_seed(int(cfg.runtime.seed))
     rng = torch.Generator(device="cpu").manual_seed(int(cfg.runtime.seed))
+    dit.gradient_checkpointing = True   # the bidirectional ±s grad passes are memory-heavy; ckpt fits 768+/1024
     dit.train()
     log_every = int(cfg.logging.log_every)
     for step in range(steps):
