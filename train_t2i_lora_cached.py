@@ -28,6 +28,7 @@ from train_t2i_full_joint_cached import (
     index_caches,
     load_sample,
     preload_all,
+    render_edit_previews,
     render_previews,
     resolve_resume_marker,
     rotate_by_glob,
@@ -101,6 +102,29 @@ def main():
     need_preview = bool(lg.sample_every) or args.smoke
     preview_encoder = encoder or (build_encoder(cfg, device, dtype, train=False) if need_preview else None)
     vae = build_vae(cfg, device, dtype) if need_preview else None
+
+    # Preview set: curated edit examples ([src|edit|tgt] rows) when a manifest is given, else t2i prompts.
+    edit_examples = None
+    if need_preview and lg.edit_preview_manifest:
+        with open(lg.edit_preview_manifest, encoding="utf-8") as _f:
+            edit_examples = [json.loads(line) for line in _f if line.strip()]
+        print(f"edit previews: {len(edit_examples)} curated examples from {lg.edit_preview_manifest}", flush=True)
+
+    def do_preview(tag):
+        if vae is None or preview_encoder is None:
+            return
+        out = os.path.join(output_dir, "samples", f"{tag}.png")
+        try:
+            if edit_examples:
+                render_edit_previews(dit, vae, preview_encoder, edit_examples, out,
+                                     res=cfg.data.resolution, steps=lg.sample_steps,
+                                     guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+            else:
+                render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count], out,
+                                res=cfg.data.resolution, steps=lg.sample_steps,
+                                guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+        except Exception as e:
+            print(f"[preview] {tag} failed (non-fatal): {type(e).__name__} {e}", flush=True)
 
     params = lora_parameters(adapters) + lora_parameters(te_adapters)
     if not params:
@@ -252,6 +276,9 @@ def main():
 
     steps = 20 if args.smoke else o.steps
     print(f"training {steps} LoRA steps (optimizer={o.optimizer}, accum={o.accum})", flush=True)
+    # Step-0 baseline: render the untrained base model's samples so every later sheet is comparable.
+    if lg.sample_every and start_step == 0:
+        do_preview("step000000_base")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()  # peak_gb = training peak, not the one-time model-load spike
     t0 = time.time()
@@ -313,22 +340,12 @@ def main():
             t0 = time.time()
         if lg.ckpt_every and (step + 1) % lg.ckpt_every == 0:
             checkpoint(step + 1)
-        if lg.sample_every and (step + 1) % lg.sample_every == 0 and vae is not None and preview_encoder:
-            render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count],
-                            os.path.join(output_dir, "samples", f"step{step + 1:06d}_dashboard.png"),
-                            res=cfg.data.resolution, steps=lg.sample_steps,
-                            guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+        if lg.sample_every and (step + 1) % lg.sample_every == 0:
+            do_preview(f"step{step + 1:06d}")
 
     if args.smoke:
         checkpoint(steps, tag="smoke")
-        if vae is not None and preview_encoder is not None:
-            try:
-                render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[:2],
-                                os.path.join(output_dir, "samples", "lora_smoke_dashboard.png"),
-                                res=cfg.data.resolution, steps=lg.sample_steps,
-                                guidance=lg.sample_guidance, seed=cfg.runtime.seed)
-            except Exception as e:
-                print(f"[smoke] preview failed (non-fatal): {type(e).__name__} {e}", flush=True)
+        do_preview("smoke")
         print("SMOKE OK", flush=True)
     else:
         checkpoint(steps, tag="final")

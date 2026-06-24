@@ -240,6 +240,40 @@ def render_previews(dit, vae, encoder, prompts, out_path, *, res, steps, guidanc
         torch.cuda.empty_cache()
 
 
+def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, guidance, seed):
+    """Edit contact-sheet: one row per example, columns [source | model edit | target (if given)].
+
+    ``examples`` = list of {"src": path, "instruction": str, "tgt": path?}. Rendered at the training
+    resolution (square, matching precache_edit) so a step-0 render is the base model's edit attempt
+    and later sheets show the same fixed edits improving toward the ground-truth target column.
+    """
+    from PIL import Image
+
+    from sample_edit import edit_sample
+
+    dit.eval()
+    try:
+        rows = []
+        for ex in examples:
+            src = Image.open(ex["src"]).convert("RGB")
+            edited = edit_sample(dit, vae, encoder, ex["instruction"], [src],
+                                 width=res, height=res, steps=steps, guidance=guidance, seed=seed)
+            cells = [src.resize((res, res)), edited]
+            if ex.get("tgt") and os.path.exists(ex["tgt"]):
+                cells.append(Image.open(ex["tgt"]).convert("RGB").resize((res, res)))
+            rows.append(cells)
+        ncol = max(len(r) for r in rows)
+        sheet = Image.new("RGB", (ncol * res, len(rows) * res), (0, 0, 0))
+        for ri, r in enumerate(rows):
+            for ci, im in enumerate(r):
+                sheet.paste(im, (ci * res, ri * res))
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        sheet.save(out_path)
+    finally:
+        dit.train()
+        torch.cuda.empty_cache()
+
+
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
@@ -295,6 +329,29 @@ def main():
     if need_preview and preview_encoder is None:
         # DiT-only training (cached text): still need a frozen encoder to render previews.
         preview_encoder = build_encoder(cfg, device, dtype, train=False)
+
+    # Preview set: curated edit examples ([src|edit|tgt] rows) when a manifest is given, else t2i prompts.
+    edit_examples = None
+    if need_preview and lg.edit_preview_manifest:
+        with open(lg.edit_preview_manifest, encoding="utf-8") as _f:
+            edit_examples = [json.loads(line) for line in _f if line.strip()]
+        print(f"edit previews: {len(edit_examples)} curated examples from {lg.edit_preview_manifest}", flush=True)
+
+    def do_preview(tag):
+        if vae is None or preview_encoder is None:
+            return
+        out = os.path.join(output_dir, "samples", f"{tag}.png")
+        try:
+            if edit_examples:
+                render_edit_previews(dit, vae, preview_encoder, edit_examples, out,
+                                     res=cfg.data.resolution, steps=lg.sample_steps,
+                                     guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+            else:
+                render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count], out,
+                                res=cfg.data.resolution, steps=lg.sample_steps,
+                                guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+        except Exception as e:
+            print(f"[preview] {tag} failed (non-fatal): {type(e).__name__} {e}", flush=True)
 
     # Param groups (separate LR for DiT vs TE).
     groups = []
@@ -459,6 +516,9 @@ def main():
 
     steps = 20 if args.smoke else o.steps
     print(f"training {steps} steps (fused={fused}, optim_state={o.optimizer_state}, te_lr={te_lr})", flush=True)
+    # Step-0 baseline: render the untrained base model's samples so every later sheet is comparable.
+    if lg.sample_every and start_step == 0:
+        do_preview("step000000_base")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()  # peak_gb = training peak, not the one-time model-load spike
     t0 = time.time()
@@ -532,21 +592,11 @@ def main():
         if lg.ckpt_every and (step + 1) % lg.ckpt_every == 0 and o.train_dit:
             checkpoint(step + 1)
 
-        if lg.sample_every and (step + 1) % lg.sample_every == 0 and vae is not None and preview_encoder:
-            render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count],
-                            os.path.join(output_dir, "samples", f"step{step + 1:06d}_dashboard.png"),
-                            res=cfg.data.resolution, steps=lg.sample_steps,
-                            guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+        if lg.sample_every and (step + 1) % lg.sample_every == 0:
+            do_preview(f"step{step + 1:06d}")
 
     if args.smoke:
-        if vae is not None and preview_encoder is not None:
-            try:
-                render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[:2],
-                                os.path.join(output_dir, "samples", "smoke_dashboard.png"),
-                                res=cfg.data.resolution, steps=lg.sample_steps,
-                                guidance=lg.sample_guidance, seed=cfg.runtime.seed)
-            except Exception as e:
-                print(f"[smoke] preview failed (non-fatal): {type(e).__name__} {e}", flush=True)
+        do_preview("smoke")
         print("SMOKE OK", flush=True)
     elif o.train_dit:
         checkpoint(steps, tag="final")

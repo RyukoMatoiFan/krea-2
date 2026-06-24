@@ -141,6 +141,7 @@ class LoggingConfig:
   sample_steps: int = 28      # sampler steps for in-training samples (Krea Base default)
   sample_guidance: float = 4.5
   sample_count: int = 4       # how many prompts/items to sample each time
+  edit_preview_manifest: str = ""  # edit runs: JSON list of {src,instruction,tgt}; renders [src|edit|tgt] rows + a step-0 base sheet
   tracker: str = "tensorboard"  # none | wandb | tensorboard (mirrors metrics.jsonl scalars)
   wandb_project: str = "krea2"
   run_name: str = ""          # tracker run name ("" -> backend default)
