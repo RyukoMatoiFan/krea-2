@@ -66,6 +66,11 @@ def main():
         raise SystemExit("slider.positive and slider.negative are required (the +/- attribute prompts)")
 
     dit = build_dit(cfg, device, dtype, load_weights=True, train=False)
+    low_vram = cfg.optim.quantize_base == "fp8"   # fits a 24GB card: fp8 base + free encoder in the loop
+    if low_vram:
+        from quantize import quantize_dit_fp8
+        quantize_dit_fp8(dit)
+        print("[slider] fp8-quantized frozen base (attn+mlp)", flush=True)
     encoder = build_encoder(cfg, device, dtype, train=False)
     vae = build_vae(cfg, device, dtype)
 
@@ -101,6 +106,14 @@ def main():
     txt_anc, m_anc = enc(s.anchor)
     print(f"[slider] (+)'{s.positive[:34]}' (-)'{s.negative[:34]}' anchor='{s.anchor or '<uncond>'}' "
           f"eta={s.eta} late_frac={s.late_frac}", flush=True)
+
+    if low_vram:                       # the training loop needs no encoder (text pre-encoded); free ~8GB
+        import gc
+        encoder = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("[slider] freed text encoder for the training loop", flush=True)
 
     imgpos = torch.zeros(1, n, 3, device=device)
     imgpos[0, :, 1] = torch.arange(gh, device=device).view(gh, 1).expand(gh, gw).reshape(-1)
@@ -156,6 +169,8 @@ def main():
     print(f"[slider] saved {out_lora}", flush=True)
 
     # 4) multi-scale [-s|off|+s] sweep (scene should hold; attribute should slide monotonically)
+    if low_vram:                       # encoder was freed for the loop; reload it for the sweep
+        encoder = build_encoder(cfg, device, dtype, train=False)
     scales = [float(x) for x in str(s.eval_scales).split(",") if x.strip()]
     print(f"[slider] rendering sweep at scales {scales}", flush=True)
     dit.eval()
