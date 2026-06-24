@@ -1,0 +1,27 @@
+# Concept-Slider LoRA for Krea 2 — a bidirectional attribute knob (velocity-space).
+#   CUDA_VISIBLE_DEVICES=0 python train_slider.py --config config/slider.yaml
+# Set the axis below (or via KREA2_SLIDER__POSITIVE / KREA2_SLIDER__NEGATIVE env).
+# Dial at inference: python sample.py --lora <slider>.safetensors --lora-scale 1.0 --prompt "..."
+# Machine paths -> user/local.yaml or KREA2_PATHS__* env.
+lora:
+  rank: 16
+optim:
+  lr: 1.0e-4
+  steps: 600
+  grad_clip: 1.0
+data:
+  resolution: 512
+slider:
+  positive: ""          # c+ attribute pushed at +scale, e.g. "dark, dim, low-key, deep shadows"
+  negative: ""          # c- attribute pushed at -scale, e.g. "bright, well-lit, daylight"
+  anchor: ""            # conditioning the slider modifies; "" -> unconditional
+  eta: 2.0              # direction strength for the training targets
+  train_scale: 1.0      # +/- adapter scale trained at
+  infer_scale: 1.0      # default inference strength (lora_scaled factor)
+  bidirectional: true   # ± knob (false = enhance-only)
+  late_frac: 1.0        # <1 -> train only the low-noise (late/detail) steps; helps detail/texture axes
+  rollouts: 6           # self-generate N context images; 0 -> read paths.data_root
+  eval_scales: "0.6,1.2"  # inference scales rendered in the [-s|off|+s] sweep
+logging:
+  log_every: 50
+  run_name: slider

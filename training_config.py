@@ -148,6 +148,21 @@ class LoggingConfig:
 
 
 @dataclass
+class SliderConfig:
+  # Concept-Slider LoRA (train_slider.py): a bidirectional attribute knob in velocity space.
+  positive: str = ""           # c+ : attribute pushed at +scale (e.g. "dark, dim, low-key")
+  negative: str = ""           # c- : attribute pushed at -scale (e.g. "bright, well-lit")
+  anchor: str = ""             # conditioning the slider modifies; "" -> unconditional
+  eta: float = 2.0             # direction strength defining the train targets
+  train_scale: float = 1.0     # +/- adapter scale trained at
+  infer_scale: float = 1.0     # default inference strength (lora_scaled factor)
+  bidirectional: bool = True   # True: ± knob; False: enhance-only (+ branch)
+  late_frac: float = 1.0       # <1 restricts training to low-noise (late/detail) steps t in (0, late_frac)
+  rollouts: int = 8            # self-generate N context images; 0 -> read paths.data_root folder
+  eval_scales: str = "0.6,1.0,1.4"  # comma list of inference scales rendered in the [-s|off|+s] sweep
+
+
+@dataclass
 class TrainConfig:
   paths: PathsConfig = field(default_factory=PathsConfig)
   runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -156,6 +171,7 @@ class TrainConfig:
   optim: OptimConfig = field(default_factory=OptimConfig)
   flow: FlowConfig = field(default_factory=FlowConfig)
   logging: LoggingConfig = field(default_factory=LoggingConfig)
+  slider: SliderConfig = field(default_factory=SliderConfig)
 
 
 # Section name -> dataclass type. Drives merging and env-override casting.
@@ -167,6 +183,7 @@ _SECTIONS = {
   "optim": OptimConfig,
   "flow": FlowConfig,
   "logging": LoggingConfig,
+  "slider": SliderConfig,
 }
 
 

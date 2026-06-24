@@ -20,7 +20,7 @@ from PIL import Image
 from safetensors.torch import load_file
 
 from loading import build_dit, build_encoder, build_vae
-from lora import load_lora
+from lora import load_lora, lora_scaled
 from sampling import sample
 from training_config import apply_runtime, dtype_of, load_config
 
@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--negative", default="")
     ap.add_argument("--ckpt", default=None, help="fine-tuned DiT state_dict (.safetensors)")
     ap.add_argument("--lora", default=None, help="trained LoRA adapters (.safetensors)")
+    ap.add_argument("--lora-scale", dest="lora_scale", type=float, default=1.0,
+                    help="runtime adapter strength (slider knob): 1.0 normal, 0 off, <0 inverts")
     ap.add_argument("--steps", type=int, default=28)
     ap.add_argument("--guidance", type=float, default=4.5, help="CFG scale (0 disables CFG; use 0 for Turbo)")
     ap.add_argument("--mu", type=float, default=None,
@@ -71,9 +73,10 @@ def main():
     prompts = [args.prompt] * args.num
     negs = [args.negative] * args.num if args.negative else None
     style_imgs = [Image.open(args.style_ref).convert("RGB")] * args.num if args.style_ref else None
-    imgs = sample(dit, vae, encoder, prompts, negative_prompts=negs, width=args.width,
-                  height=args.height, steps=args.steps, guidance=args.guidance, seed=args.seed,
-                  mu=args.mu, y1=args.y1, y2=args.y2, images=style_imgs)
+    with lora_scaled(dit, args.lora_scale):  # no-op when no LoRA / scale 1.0; the slider knob otherwise
+        imgs = sample(dit, vae, encoder, prompts, negative_prompts=negs, width=args.width,
+                      height=args.height, steps=args.steps, guidance=args.guidance, seed=args.seed,
+                      mu=args.mu, y1=args.y1, y2=args.y2, images=style_imgs)
     if args.num == 1:
         imgs[0].save(args.out)
         print("saved", args.out, flush=True)

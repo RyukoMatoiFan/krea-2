@@ -10,6 +10,7 @@ adapter is a no-op at step 0).
 """
 from __future__ import annotations
 
+import contextlib
 import math
 
 import torch
@@ -33,6 +34,7 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
         self.rank = rank
         self.scale = alpha / rank
+        self.scale_mul = 1.0  # runtime multiplier (slider knob); 1.0 -> normal LoRA, 0.0 -> off
         dev = base.weight.device
         self.lora_A = nn.Parameter(torch.empty(rank, base.in_features, device=dev, dtype=torch.float32))
         self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, device=dev, dtype=torch.float32))
@@ -40,8 +42,32 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
+        if self.scale_mul == 0.0:
+            return out
         delta = (x.to(self.lora_A.dtype) @ self.lora_A.t()) @ self.lora_B.t()
-        return out + self.scale * delta.to(out.dtype)
+        return out + (self.scale * self.scale_mul) * delta.to(out.dtype)
+
+
+@contextlib.contextmanager
+def lora_scaled(model: nn.Module, factor: float):
+    """Temporarily multiply every injected adapter's effect by ``factor`` (the slider knob).
+
+    ``factor`` may be negative (invert the direction) or 0 (disable). Restores prior scales on exit.
+    """
+    mods = [m for m in model.modules() if isinstance(m, LoRALinear)]
+    prev = [m.scale_mul for m in mods]
+    try:
+        for m in mods:
+            m.scale_mul = float(factor)
+        yield
+    finally:
+        for m, p in zip(mods, prev):
+            m.scale_mul = p
+
+
+def lora_disabled(model: nn.Module):
+    """Context manager: run with all injected adapters off (frozen-base prediction)."""
+    return lora_scaled(model, 0.0)
 
 
 def _resolve(parent: nn.Module, dotted: str):
