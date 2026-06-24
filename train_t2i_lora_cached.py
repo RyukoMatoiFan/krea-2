@@ -81,13 +81,18 @@ def main():
           f"te_lora={train_te} train_dit={lc.train_transformer}", flush=True)
 
     dit = build_dit(cfg, device, dtype, load_weights=True, train=False)
-    if o.quantize_base == "fp8" and lc.train_transformer:
+    fp8_base = o.quantize_base == "fp8" and lc.train_transformer
+    if fp8_base:
         from quantize import quantize_dit_fp8   # frozen-base e4m3 -> ~half base VRAM (helps fit 16GB @1024)
         nq = quantize_dit_fp8(dit)
         print(f"fp8-quantized {nq} frozen base Linears (attn+mlp) -> ~half base VRAM", flush=True)
     adapters = inject_lora(dit, lc.rank, lc.alpha, include_txtfusion=lc.target_txtfusion) \
         if lc.train_transformer else {}          # train_transformer=False -> TE-only (DiT frozen)
-    dit.gradient_checkpointing = o.grad_checkpointing
+    # fp8 REQUIRES grad-ckpt: else the per-forward dequant is retained for backward across every layer,
+    # erasing the saving (and OOM-ing). Force it on when fp8 is active.
+    if fp8_base and not o.grad_checkpointing:
+        print("note: enabling gradient checkpointing (required by the fp8 base)", flush=True)
+    dit.gradient_checkpointing = o.grad_checkpointing or fp8_base
     dit.train()  # enables grad-ckpt; base params stay frozen, only adapters require grad
     print(f"injected {len(adapters)} LoRA adapters", flush=True)
     if o.blocks_to_swap:

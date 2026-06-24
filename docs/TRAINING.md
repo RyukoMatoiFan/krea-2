@@ -54,6 +54,22 @@ ai-toolkit/ComfyUI key format (`diffusion_model.<path>.lora_{A,B}.weight`) so a 
 loads on Turbo. Tune `lora.rank` / `lora.alpha`; `lora.target_txtfusion: true` also adapts the
 text-fusion stage. Targets the attention `wq/wk/wv/wo/gate` + MLP `gate/up/down` per block.
 
+## 2c. Concept sliders
+
+`train_slider.py` trains a bidirectional attribute LoRA with **no dataset**: it regresses a ±adapter
+onto the frozen base's own velocity, nudged along (`slider.positive` − `slider.negative`) at a neutral
+anchor. Context latents are self-generated rollouts (or `slider.rollouts: 0` reads `paths.data_root`
+for a domain-specific knob). Set the axis in `config/slider.yaml` or via env:
+
+```bash
+KREA2_SLIDER__POSITIVE="sharp, 4K, crisp, fine detail" KREA2_SLIDER__NEGATIVE="blurry, soft, low detail" \
+  python train_slider.py --config config/slider.yaml
+```
+Dial the knob at inference with `sample.py --lora-scale` (`1.0` normal, `0` off, `<0` inverts) — positive
+→ the attribute, negative → away from it. `slider_render.py` renders a multi-scale `[-s | off | +s]`
+sweep. Subtle high-frequency axes (detail/sharpness) need a higher `slider.eta` than strong global ones
+(exposure); `slider.late_frac < 1` confines training to the low-noise (texture) steps.
+
 ## Resume, EMA, validation
 
 Both trainers checkpoint weights + optimizer/scheduler/RNG and write a `resume.json` marker. Set
@@ -62,7 +78,7 @@ a resumable checkpoint before exit. `optim.use_ema: true` keeps a CPU EMA of the
 (zero extra VRAM; saved alongside each checkpoint). `logging.val_every: N` logs a deterministic,
 low-variance held-out flow-matching loss on the `data.n_eval_holdout` eval split.
 
-## Lower VRAM: block swap
+## Lower VRAM: block swap + fp8 quantization
 
 `optim.blocks_to_swap: N` parks the **N deepest** transformer blocks on CPU and pages each to the GPU
 only for its forward/backward (`SingleStreamDiT.enable_block_swap`). It pairs with gradient
@@ -75,6 +91,25 @@ pushing resolution/batch). At 1024 with 14/28 blocks swapped, a LoRA run drops p
 
 ```bash
 KREA2_OPTIM__BLOCKS_TO_SWAP=14 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
+```
+
+`optim.quantize_base: fp8` (LoRA only) stores the frozen base's attention+MLP weights in 8-bit (e4m3,
+per-row scale) and dequantizes on the fly, roughly halving the resident base. It **requires gradient
+checkpointing** — the per-forward dequant would otherwise be retained for the backward across every
+layer, erasing the saving — so the trainer enables it automatically when fp8 is on. The three levers
+compose with an unchanged loss curve (measured, rank-16 LoRA @768):
+
+| config | peak VRAM |
+|---|---|
+| baseline (bf16 base) | 28.8 GB |
+| `quantize_base: fp8` | 17.5 GB (−39%) |
+| fp8 + `blocks_to_swap: 14` | 11.9 GB (−59%) |
+
+A LoRA then fits a 16 GB (even 12 GB) card; ~1.9× per-step time with both on.
+
+```bash
+KREA2_OPTIM__QUANTIZE_BASE=fp8 KREA2_OPTIM__BLOCKS_TO_SWAP=14 \
+  python train_t2i_lora_cached.py --config config/t2i_lora.yaml
 ```
 
 ## 3. Monitor
@@ -126,4 +161,15 @@ different-content training pairs.
 
 `sample.py` uses the reference sampler. Raw: `--steps 52 --guidance 3.5`. **Turbo** (run a Raw-trained
 LoRA on the distilled checkpoint): `--base krea/Krea-2-Turbo --base-file turbo.safetensors --steps 8
---guidance 0 --mu 1.15 --lora <your_lora>.safetensors`.
+--guidance 0 --mu 1.15 --lora <your_lora>.safetensors`. Add `--lora-scale <s>` to dial a concept
+slider.
+
+## Regional prompting
+
+`sampling.sample_regions` places a different prompt in each image region — opt-in, the default sampler
+is byte-identical. It routes each region's image tokens to their own text segment via the model's
+`attn_mask_override` / `txt_attn_override` kwargs (both default `None`); `isolate_regions` (default on)
+keeps each region's image self-attention local, so two single-subject prompts render as two distinct,
+placed subjects (at the cost of a seam between regions — drop it for one coherent scene). Pass
+`regions=[{"prompt": ..., "box": (x0, y0, x1, y1)}]` with box edges as 0–1 fractions. Combine with a
+LoRA to place trained identities/styles per region.
