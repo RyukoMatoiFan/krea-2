@@ -434,12 +434,20 @@ class SingleStreamDiT(nn.Module):
         t: Tensor,
         pos: Tensor,
         mask: Tensor | None = None,
+        attn_mask_override: Tensor | None = None,
+        txt_attn_override: Tensor | None = None,
     ) -> Tensor:
+        # ``attn_mask_override`` / ``txt_attn_override`` are OPT-IN regional-attention masks
+        # (bool, (B,1,L,L) / (B,1,txtlen,txtlen)) ANDed onto the default key-padding mask to route
+        # image regions to their own text segment. Both default None -> the standard path below is
+        # byte-identical; only sampling.sample_regions sets them.
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
 
         txtmask = _mask(mask[:, : context.shape[1]])
+        if txt_attn_override is not None:
+            txtmask = txtmask & txt_attn_override
 
         context = self.txtfusion(context, mask=txtmask)
         context = self.txtmlp(context)
@@ -456,6 +464,10 @@ class SingleStreamDiT(nn.Module):
             pos = F.pad(pos, (0, 0, 0, _padlen))
 
         mask = _mask(mask)
+        if attn_mask_override is not None:
+            if _padlen > 0:
+                attn_mask_override = F.pad(attn_mask_override, (0, _padlen, 0, _padlen), value=False)
+            mask = mask & attn_mask_override
 
         freqs = self.posemb(pos)
 
