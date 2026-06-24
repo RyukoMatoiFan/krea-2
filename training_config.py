@@ -107,6 +107,7 @@ class OptimConfig:
   num_restarts: int = 1            # cycles for cosine_restarts
   offload_optimizer: bool = False  # full-FT: keep Adam moments in CPU RAM (lower VRAM, host-RAM cost)
   blocks_to_swap: int = 0          # page N deepest blocks CPU<->GPU per fwd/bwd (LoRA: frozen base only; full-FT pages all, slower)
+  quantize_base: str = ""          # LoRA: "" off | "fp8" -> e4m3-quantize the frozen base blocks (~half base VRAM)
   weight_decay: float = 0.01       # full-FT AdamW weight decay
   te_lr: float = 0.0               # joint full-FT: separate (lower) LR for the text encoder;
                                    # 0 -> lr/10 when training the DiT too, else lr (TE-only stage)

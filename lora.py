@@ -96,7 +96,8 @@ def inject_lora(dit, rank: int, alpha: float | None = None, *, targets=DEFAULT_T
                     base = getattr(parent, leaf)
                 except AttributeError:
                     continue
-                if not isinstance(base, nn.Linear):
+                # nn.Linear, or an fp8-quantized base (quantize.Fp8Linear) carrying the same interface
+                if not (isinstance(base, nn.Linear) or getattr(base, "is_quant_linear", False)):
                     continue
                 lora = LoRALinear(base, rank, alpha)
                 setattr(parent, leaf, lora)

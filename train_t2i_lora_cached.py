@@ -81,6 +81,10 @@ def main():
           f"te_lora={train_te} train_dit={lc.train_transformer}", flush=True)
 
     dit = build_dit(cfg, device, dtype, load_weights=True, train=False)
+    if o.quantize_base == "fp8" and lc.train_transformer:
+        from quantize import quantize_dit_fp8   # frozen-base e4m3 -> ~half base VRAM (helps fit 16GB @1024)
+        nq = quantize_dit_fp8(dit)
+        print(f"fp8-quantized {nq} frozen base Linears (attn+mlp) -> ~half base VRAM", flush=True)
     adapters = inject_lora(dit, lc.rank, lc.alpha, include_txtfusion=lc.target_txtfusion) \
         if lc.train_transformer else {}          # train_transformer=False -> TE-only (DiT frozen)
     dit.gradient_checkpointing = o.grad_checkpointing
