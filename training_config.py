@@ -72,6 +72,7 @@ class DataConfig:
   resolution: int = 1024
   img_ext: str = "jpg"
   instr_field: str = "edit"        # (edit/multiref) field naming the instruction in metadata
+  text_system_prompt: str = ""     # "" -> Krea2 native descriptor; set an edit-framed prompt for edit FFT
   meta_at_root: bool = False
   limit: int = 0
   n_eval_holdout: int = 4

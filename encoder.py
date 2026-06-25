@@ -23,6 +23,7 @@ class Qwen3VLConditioner(torch.nn.Module):
         version: str,
         max_length: int = 512,
         select_layers: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35),
+        system_prompt: str = "",
     ):
         super().__init__()
         self.qwen = Qwen3VLForConditionalGeneration.from_pretrained(version)
@@ -35,9 +36,17 @@ class Qwen3VLConditioner(torch.nn.Module):
         self.qwen = self.qwen.eval().requires_grad_(False)
         self.max_length = max_length
         self.select_layers = select_layers
-        self.prompt_template_encode_prefix = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n"
+        # Default (system_prompt="") reproduces Krea 2's native descriptor BYTE-FOR-BYTE and keeps the
+        # validated drop index 34. An edit-framed prompt (e.g. "Edit the reference image according to
+        # the instruction:") has a different token count, so derive the drop index from the tokenizer.
+        sysp = system_prompt or self.SYSTEM_PROMPT
+        self.system_prompt = sysp
+        self.prompt_template_encode_prefix = f"<|im_start|>system\n{sysp}<|im_end|>\n<|im_start|>user\n"
         self.prompt_template_encode_suffix = "<|im_end|>\n<|im_start|>assistant\n"
-        self.prompt_template_encode_start_idx = 34
+        self.prompt_template_encode_start_idx = (
+            34 if not system_prompt
+            else len(self.tokenizer(self.prompt_template_encode_prefix)["input_ids"])
+        )
         self.prompt_template_encode_suffix_start_idx = 5
 
     # System prompt content shared by the text and image-conditioning paths.
@@ -106,7 +115,7 @@ class Qwen3VLConditioner(torch.nn.Module):
             images = [images] * len(text)
         chats = [
             self._mm_processor.apply_chat_template(
-                [{"role": "system", "content": self.SYSTEM_PROMPT},
+                [{"role": "system", "content": self.system_prompt},
                  {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": t}]}],
                 tokenize=False, add_generation_prompt=True)
             for t in text

@@ -87,6 +87,7 @@ def build_encoder(cfg, device, dtype, *, train: bool = False) -> Qwen3VLConditio
         cfg.paths.text_encoder_id,
         max_length=TEXT_MAX_LENGTH,
         select_layers=QWEN3_VL_SELECT_LAYERS,
+        system_prompt=getattr(cfg.data, "text_system_prompt", ""),
     )
     enc = enc.to(device=device, dtype=dtype)
     if train:
