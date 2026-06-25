@@ -302,10 +302,14 @@ def main():
     probe = next(iter(train_by_bucket.values()))[0]
     has_cached_text = "llm_text" in load_sample(probe, device)
 
-    # Decide text path: DiT-only uses cached text; joint trains the TE (live encode).
-    train_te = (o.te_lr != 0.0) or (not has_cached_text)
-    te_lr = o.te_lr if o.te_lr > 0 else (o.lr / 10 if (o.train_dit and train_te) else o.lr)
+    # Decide text path. Two INDEPENDENT questions (don't conflate them):
+    #   train the TE?  -> only when te_lr>0 (explicit joint FFT); TE-FFT on narrow data risks forgetting.
+    #   live-encode?   -> whenever the TE trains OR the cache holds no text. The latter is the
+    #                     latents-only cache: a FROZEN Qwen3-VL re-encodes the stored caption each step
+    #                     (same signal as caching, but no ~3.8MB/prompt 12-layer text on disk).
+    train_te = (o.te_lr > 0.0)
     use_live_text = train_te or (not has_cached_text)
+    te_lr = o.te_lr if o.te_lr > 0 else 0.0
     print(f"caches: {n_train} train / {len(eval_paths)} eval, buckets={bucket_keys}, "
           f"cached_text={has_cached_text}, train_te={train_te}, live_text={use_live_text}", flush=True)
 
