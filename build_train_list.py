@@ -51,20 +51,26 @@ def main() -> None:
     ap.add_argument("--w-text", type=int, default=4)
     ap.add_argument("--w-person", type=int, default=2)
     ap.add_argument("--w-global", type=int, default=1)
+    ap.add_argument("--exclude", default="", help="JSON list of manifest line indices to drop (held-out eval)")
     args = ap.parse_args()
     mult = {"structural": args.w_structural, "text": args.w_text,
             "person": args.w_person, "global": args.w_global}
+    exclude = set(json.load(open(args.exclude, encoding="utf-8"))) if args.exclude else set()
 
     entries: list[str] = []
     by_type = collections.Counter()
     by_fam_in = collections.Counter()
     by_fam_out = collections.Counter()
     type_fam: dict[str, str] = {}
+    excluded = 0
 
     with open(args.manifest, encoding="utf-8") as f:
         for i, ln in enumerate(f):
             ln = ln.strip()
             if not ln:
+                continue
+            if i in exclude:
+                excluded += 1
                 continue
             et = json.loads(ln).get("edit_type", "")
             fam = family_of(et)
@@ -89,7 +95,8 @@ def main() -> None:
         pin = 100 * by_fam_in[fam] / n_in if n_in else 0
         pout = 100 * by_fam_out[fam] / n_out if n_out else 0
         print(f"  {fam:>10} x{mult[fam]}:  {by_fam_in[fam]:7d} ({pin:4.1f}%)  ->  {by_fam_out[fam]:7d} ({pout:4.1f}%)")
-    print(f"\nDONE manifest_lines={n_in}  train_list_entries={n_out}  (epoch grows {n_out/n_in:.2f}x) -> {args.out}")
+    print(f"\nDONE manifest_lines={n_in}  excluded(held-out)={excluded}  train_list_entries={n_out}  "
+          f"(epoch grows {n_out/n_in:.2f}x) -> {args.out}")
 
 
 if __name__ == "__main__":
