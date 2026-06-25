@@ -267,8 +267,16 @@ def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, g
         for ri, r in enumerate(rows):
             for ci, im in enumerate(r):
                 sheet.paste(im, (ci * res, ri * res))
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        sdir = os.path.dirname(out_path)
+        os.makedirs(sdir, exist_ok=True)
         sheet.save(out_path)
+        # Sidecars so the dashboard splits this sheet into one captioned card per example
+        # (rows = examples; layout 'edit' makes /tile slice by row). Cheap; rewritten each call.
+        with open(os.path.join(sdir, "prompts.json"), "w", encoding="utf-8") as pf:
+            json.dump({i: ex.get("instruction", "") for i, ex in enumerate(examples)}, pf,
+                      ensure_ascii=False)
+        with open(os.path.join(sdir, "layout.json"), "w", encoding="utf-8") as lf:
+            json.dump({"mode": "edit", "cols": ncol}, lf)
     finally:
         dit.train()
         torch.cuda.empty_cache()

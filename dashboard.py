@@ -10,6 +10,10 @@ Curated T2I previews are saved as a single 4-column CONTACT SHEET per step
 prompt server-side (``/tile``) so each preview is its own hoverable / clickable image --
 no trainer change or restart needed. Per-tile files (``..idxK..``) are used directly.
 
+EDIT previews are instead one full-width ROW per example ([source | model edit | target]).
+A ``samples/layout.json`` (``{"mode":"edit"}``) switches ``/tile`` to row-slicing so each
+example becomes its own card, captioned by its instruction from ``samples/prompts.json``.
+
 Optional ``--base-dir`` (a directory of per-prompt ``idxK.png`` base-model tiles, e.g.
 ``<output_dir>/base_previews``) enables a click-to-toggle BASE vs current preview per
 prompt for easy comparison.
@@ -31,7 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote, urlparse, parse_qs
 
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
-_SHEET_COLS = 4  # curated preview contact sheets are built 4-wide (train_t2i_full_cached._sample)
+_SHEET_COLS = 4  # T2I preview contact sheets are built 4-wide (train_t2i_full_cached._sample)
+_IMG_CACHE = {}  # {path: (mtime, PIL.Image)} -- decode a contact sheet once per version, not per poll
 
 _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -134,7 +139,7 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
    <button id="last" title="latest">⏭</button>
   </div>
  </div>
- <div class="hint">Click an image to <b>zoom</b> (preview + base side by side) · double-click to toggle <b>BASE</b> inline · ◀ ▶ (or arrow keys) page through preview steps.</div>
+ <div class="hint">Click an image to <b>zoom</b> (preview + base side by side) · double-click to toggle <b>BASE</b> inline · ◀ ▶ (or arrow keys) page through preview steps. <b>Edit runs:</b> each card is one example — within the strip, left = <b>source</b>, center = <b>model output</b>, right = <b>target</b> (ground truth).</div>
  <div class="grid" id="gallery"><div class="empty">no previews yet</div></div>
 </div>
 <div id="lb">
@@ -322,6 +327,16 @@ class Handler(BaseHTTPRequestHandler):
         return {}
     return {}
 
+  def _layout(self):
+    """Optional ``samples/layout.json``; ``{"mode":"edit"}`` makes /tile slice by row."""
+    p = os.path.join(self._samples_root(), "layout.json")
+    if os.path.isfile(p):
+      try:
+        return json.load(open(p, encoding="utf-8"))
+      except Exception:
+        return {}
+    return {}
+
   @staticmethod
   def _stepof(f):
     m = re.search(r"step(\d+)", f)
@@ -387,8 +402,24 @@ class Handler(BaseHTTPRequestHandler):
     p = os.path.join(self._base_root(), f"idx{k}.png")
     self._serve_file(p) if os.path.isfile(p) else self._send(404, "{}")
 
+  def _sheet(self, p):
+    """Decode a contact sheet once per (path, mtime) and cache the PIL image, so a tall
+    edit sheet (many rows, tens of MB) is not re-decoded on every poll / tile request."""
+    from PIL import Image
+    mt = os.path.getmtime(p)
+    hit = _IMG_CACHE.get(p)
+    if hit and hit[0] == mt:
+      return hit[1]
+    img = Image.open(p).convert("RGB")
+    _IMG_CACHE.clear()  # only ever need the most-recent sheet resident
+    _IMG_CACHE[p] = (mt, img)
+    return img
+
   def _serve_tile(self, rest):
-    """/tile/<file>/<k> -> crop tile k out of a 4-column contact sheet."""
+    """/tile/<file>/<k> -> crop preview k out of a contact sheet.
+
+    T2I sheets are a 4-column grid; EDIT sheets (``layout.json`` mode ``edit``) are one
+    full-width row per example ([source | model edit | target])."""
     try:
       name, k = rest.rsplit("/", 1)
       k = int(k)
@@ -398,17 +429,20 @@ class Handler(BaseHTTPRequestHandler):
     if not p:
       return self._send(404, "{}")
     try:
-      from PIL import Image
-      img = Image.open(p).convert("RGB")
+      img = self._sheet(p)
       n = max(1, len(self._prompts()))
-      cols = _SHEET_COLS
-      rows = math.ceil(n / cols)
       W, H = img.size
-      tw, th = W // cols, H // rows
-      col, row = k % cols, k // cols
-      tile = img.crop((col * tw, row * th, col * tw + tw, row * th + th))
+      if self._layout().get("mode") == "edit":
+        th = H // n                       # one full-width row per example
+        box = (0, k * th, W, k * th + th)
+      else:
+        cols = _SHEET_COLS
+        rows = math.ceil(n / cols)
+        tw, th = W // cols, H // rows
+        col, row = k % cols, k // cols
+        box = (col * tw, row * th, col * tw + tw, row * th + th)
       buf = BytesIO()
-      tile.save(buf, "PNG")
+      img.crop(box).save(buf, "PNG")
       self._send(200, buf.getvalue(), "image/png")
     except Exception:
       self._send(404, "{}")
