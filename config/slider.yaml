@@ -1,27 +1,27 @@
 # Concept-Slider LoRA for Krea 2 — a bidirectional attribute knob (velocity-space).
 #   CUDA_VISIBLE_DEVICES=0 python train_slider.py --config config/slider.yaml
-# Set the axis below (or via KREA2_SLIDER__POSITIVE / KREA2_SLIDER__NEGATIVE env).
-# Dial at inference: python sample.py --lora <slider>.safetensors --lora-scale 1.0 --prompt "..."
-# Machine paths -> user/local.yaml or KREA2_PATHS__* env.
+# Defaults below are a detailization axis (eta 3.0 / late_frac 0.7). Dial at inference with
+#   python sample.py --lora <slider>.safetensors --lora-scale 3.0 --prompt "..."   (useful range -3..+5).
+# Override the axis via KREA2_SLIDER__POSITIVE / KREA2_SLIDER__NEGATIVE. Machine paths -> user/local.yaml.
 lora:
-  rank: 16
+  rank: 32
 optim:
   lr: 1.0e-4
-  steps: 600
+  steps: 1200
   grad_clip: 1.0
 data:
-  resolution: 512
+  resolution: 768
 slider:
-  positive: ""          # c+ attribute pushed at +scale, e.g. "dark, dim, low-key, deep shadows"
-  negative: ""          # c- attribute pushed at -scale, e.g. "bright, well-lit, daylight"
+  positive: "intricately detailed, fine intricate detail, dense ornate detail, elaborate textures, highly detailed masterpiece"
+  negative: "plain, smooth, flat, undetailed, sparse, simple"
   anchor: ""            # conditioning the slider modifies; "" -> unconditional
-  eta: 2.0              # direction strength for the training targets
+  eta: 3.0              # direction strength for the training targets
   train_scale: 1.0      # +/- adapter scale trained at
-  infer_scale: 1.0      # default inference strength (lora_scaled factor)
+  infer_scale: 3.0      # default inference strength (lora_scaled factor); useful range -3..+5
   bidirectional: true   # ± knob (false = enhance-only)
-  late_frac: 1.0        # <1 -> train only the low-noise (late/detail) steps; helps detail/texture axes
-  rollouts: 6           # self-generate N context images; 0 -> read paths.data_root
-  eval_scales: "0.6,1.2"  # inference scales rendered in the [-s|off|+s] sweep
+  late_frac: 0.7        # <1 -> train only the low-noise (late/detail) steps; near 1.0 destabilizes a strong slider
+  rollouts: 8           # self-generate N context images; 0 -> read paths.data_root
+  eval_scales: "3,5"    # inference scales rendered in the [-s|off|+s] sweep
 logging:
   log_every: 50
   run_name: slider
