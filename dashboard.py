@@ -127,6 +127,7 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div class="wrap">
  <div class="charts">
   <div class="card"><h3>loss &amp; val</h3><canvas id="loss"></canvas></div>
+  <div class="card"><h3>grad norm (DiT / TE)</h3><canvas id="gnorm"></canvas></div>
   <div class="card"><h3>peak VRAM (GB)</h3><canvas id="vram"></canvas></div>
   <div class="card"><h3>sec / step</h3><canvas id="speed"></canvas></div>
  </div>
@@ -168,6 +169,8 @@ loss.data.datasets=[
  {label:'loss (ema)',data:[],borderColor:'#6ea8fe',backgroundColor:'#6ea8fe',pointRadius:0,borderWidth:2,tension:.25},
  {label:'val',data:[],borderColor:'#e3b341',backgroundColor:'#e3b341',pointRadius:0,borderWidth:2.5,tension:.25},
 ];
+const gnorm=new Chart(document.getElementById('gnorm'),gridCfg({legend:true}));
+gnorm.data.datasets=[ds('DiT','#6ea8fe'),ds('TE','#d2a8ff')];
 const vram=new Chart(document.getElementById('vram'),gridCfg());vram.data.datasets=[ds('vram','#f2756b',true)];
 const speed=new Chart(document.getElementById('speed'),gridCfg());speed.data.datasets=[ds('s/step','#56d364')];
 const chip=(k,v,cls='')=>`<span class="chip ${cls}"><span class="k">${k}</span><b>${v}</b></span>`;
@@ -240,13 +243,17 @@ async function pollMetrics(){
   let e=null;const ema=[];for(const r of lr_){e=e==null?r.loss:e*0.9+r.loss*0.1;ema.push({x:r.step,y:e});}
   loss.data.datasets[1].data=ema;
   loss.data.datasets[2].data=m.filter(r=>r.val_loss!=null).map(r=>({x:r.step,y:r.val_loss}));
+  gnorm.data.datasets[0].data=m.filter(r=>r.dit_grad_norm!=null).map(r=>({x:r.step,y:r.dit_grad_norm}));
+  gnorm.data.datasets[1].data=m.filter(r=>r.te_grad_norm!=null).map(r=>({x:r.step,y:r.te_grad_norm}));
   vram.data.datasets[0].data=m.map(r=>({x:r.step,y:r.peak_gb}));
   speed.data.datasets[0].data=m.map(r=>({x:r.step,y:r.s_per_step}));
-  loss.update();vram.update();speed.update();
+  loss.update();gnorm.update();vram.update();speed.update();
   const last=m[m.length-1],step=last.step||0,total=TOTAL||last.total||0;
   const vals=m.filter(r=>r.val_loss!=null),sps=last.s_per_step||0,eta=total&&sps?fmt((total-step)*sps):'—';
+  const teg=m.filter(r=>r.te_grad_norm!=null);
   G('chips').innerHTML=chip('step',step.toLocaleString()+(total?' / '+total.toLocaleString():''))
    +chip('loss',(last.loss||0).toFixed(4))+(vals.length?chip('val',vals[vals.length-1].val_loss.toFixed(4),'v'):'')
+   +(teg.length?chip('TE |∇|',teg[teg.length-1].te_grad_norm.toFixed(3),'v'):'')
    +chip('s/it',sps.toFixed(2))+chip('VRAM',(last.peak_gb||0).toFixed(1)+'G')
    +chip('lr',(last.lr||0).toExponential(1))+chip('ETA',eta);
   if(total){G('fill').style.width=Math.min(100,100*step/total)+'%';

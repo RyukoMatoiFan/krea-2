@@ -368,9 +368,9 @@ def main():
     # Param groups (separate LR for DiT vs TE).
     groups = []
     if o.train_dit:
-        groups.append({"params": [p for p in dit.parameters() if p.requires_grad], "lr": o.lr})
+        groups.append({"params": [p for p in dit.parameters() if p.requires_grad], "lr": o.lr, "name": "dit"})
     if train_te and encoder is not None:
-        groups.append({"params": [p for p in encoder.qwen.parameters() if p.requires_grad], "lr": te_lr})
+        groups.append({"params": [p for p in encoder.qwen.parameters() if p.requires_grad], "lr": te_lr, "name": "te"})
     if not groups:
         raise SystemExit("nothing to train (train_dit=False and train_te=False)")
 
@@ -383,17 +383,36 @@ def main():
                                   total_steps=o.steps, min_lr_ratio=o.min_lr_ratio,
                                   num_restarts=o.num_restarts)
 
+    # Positional group indices (order is fixed: dit first if trained, then te). Used for the
+    # live-group lookup below and for reading te's LR at log time -- both robust to
+    # load_state_dict, which replaces the param-group dicts on resume (see the hook note).
+    te_gidx = (len(groups) - 1) if (train_te and encoder is not None) else None
+
+    # Per-step, per-group grad-norm accumulator (sum of per-param grad-norm^2 within a step).
+    # Folded into the interval mean at each log flush -> per-group learning-signal metric
+    # (e.g. te_grad_norm shows the jointly-trained TE is actually receiving/using gradient).
+    gstep = {"dit": 0.0, "te": 0.0}
+
     # Fused per-parameter backward (accum==1): step + free each grad as it lands.
     fused = (o.accum == 1)
     if fused:
-        for group in opt.param_groups:
+        for gidx, group in enumerate(opt.param_groups):
+            nm = group.get("name", "dit")           # captured as a str -> survives load_state_dict
             for p in group["params"]:
-                def _hook(param, g=group):
+                def _hook(param, gidx=gidx, nm=nm):
+                    # Look up the LIVE group by index: load_state_dict (resume) swaps the group
+                    # dicts, so a captured dict would carry a stale (frozen) LR. Indexing
+                    # opt.param_groups keeps step_parameter on the scheduler-updated group.
+                    g = opt.param_groups[gidx]
                     if param.grad is None or not torch.isfinite(param.grad).all():
                         param.grad = None
                         return
+                    # clip_grad_norm_ already returns the pre-clip norm -> capture it for free.
                     if o.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(param, o.grad_clip)
+                        gn = torch.nn.utils.clip_grad_norm_(param, o.grad_clip)
+                    else:
+                        gn = param.grad.detach().norm()
+                    gstep[nm] += float(gn) ** 2
                     opt.step_parameter(param, g, 0)
                     param.grad = None
                 p.register_post_accumulate_grad_hook(_hook)
@@ -536,6 +555,8 @@ def main():
     t0 = time.time()
     run_loss = 0.0
     n_skipped = 0
+    gsum = {"dit": 0.0, "te": 0.0}   # interval sum of per-step total grad norms (per group)
+    gcnt = 0                          # number of optimizer steps folded into gsum this interval
 
     for step in range(start_step, steps):
         _state["step"] = step
@@ -564,7 +585,7 @@ def main():
             continue
 
         if fused:
-            loss.backward()                 # hooks step + free each grad
+            loss.backward()                 # hooks step + free each grad (also fills gstep)
         else:
             (loss / o.accum).backward()
             if (step + 1) % o.accum == 0:
@@ -572,10 +593,20 @@ def main():
                     for p in group["params"]:
                         if p.grad is not None and torch.isfinite(p.grad).all():
                             if o.grad_clip:
-                                torch.nn.utils.clip_grad_norm_(p, o.grad_clip)
+                                gn = torch.nn.utils.clip_grad_norm_(p, o.grad_clip)
+                            else:
+                                gn = p.grad.detach().norm()
+                            gstep[group.get("name", "dit")] += float(gn) ** 2
                             opt.step_parameter(p, group, 0)
                         if p.grad is not None:
                             p.grad = None
+        # Fold this step's per-group total grad norm (sqrt of summed per-param norm^2) into the
+        # interval mean, then reset the per-step accumulator. Only when an optimizer step happened.
+        if fused or (step + 1) % o.accum == 0:
+            for _nm in gstep:
+                gsum[_nm] += gstep[_nm] ** 0.5
+                gstep[_nm] = 0.0
+            gcnt += 1
         sched_lr.step()
         run_loss += float(loss.detach())
         if ema is not None:
@@ -586,11 +617,22 @@ def main():
             rec = {"step": step + 1, "loss": run_loss / lg.log_every,
                    "lr": sched_lr.get_last_lr()[0], "s_per_step": round(dt, 3),
                    "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2), "skipped": n_skipped}
+            # Per-group grad-norm (mean over the interval). There is ONE joint flow loss (no
+            # separate TE loss exists); te_grad_norm is the honest "is the TE learning" signal.
+            if gcnt:
+                rec["dit_grad_norm"] = round(gsum["dit"] / gcnt, 4)
+                if train_te and te_gidx is not None:
+                    # Read the live per-group LR from the optimizer (get_last_lr()'s cached
+                    # _last_lr is not restored on resume; opt.param_groups is the source of truth).
+                    rec["te_grad_norm"] = round(gsum["te"] / gcnt, 4)
+                    rec["te_lr"] = opt.param_groups[te_gidx]["lr"]
             with open(metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
             tracker.log(rec, rec["step"])
             print(rec, flush=True)
             run_loss = 0.0
+            gsum = {"dit": 0.0, "te": 0.0}
+            gcnt = 0
             t0 = time.time()
 
         if lg.val_every and (step + 1) % lg.val_every == 0 and val_groups:
