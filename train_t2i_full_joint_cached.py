@@ -282,6 +282,25 @@ def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, g
         torch.cuda.empty_cache()
 
 
+def slice_base_tiles(sheet_path, base_root, n):
+    """Slice a base edit contact-sheet (``n`` example rows) into per-example BASE tiles
+    ``idx0..n-1`` that the dashboard serves for its base-vs-current toggle. Stale tiles are
+    cleared first so a shrunk/reordered manifest never leaves orphans. No-op if the sheet
+    is missing."""
+    from PIL import Image
+
+    if not os.path.exists(sheet_path):
+        return
+    os.makedirs(base_root, exist_ok=True)
+    for old in glob.glob(os.path.join(base_root, "idx*.png")):
+        os.remove(old)
+    sheet = Image.open(sheet_path)
+    W, H = sheet.size
+    th = H // max(1, n)
+    for k in range(n):
+        sheet.crop((0, k * th, W, k * th + th)).save(os.path.join(base_root, f"idx{k}.png"))
+
+
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
@@ -531,6 +550,19 @@ def main():
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
+    # ----- Base edit-preview baseline (BEFORE any resume weight-load, while the DiT still holds
+    # base weights): render the untrained model's edit sheet + slice per-example BASE tiles so the
+    # dashboard's base-vs-current toggle stays aligned with the CURRENT manifest. Regenerated only
+    # when the tiles are missing or their count no longer matches the manifest (e.g. the preview set
+    # was edited), so a resume with an unchanged manifest skips it and a resume after editing the
+    # set refreshes the base counterparts instead of leaving them stale. -----
+    if lg.sample_every and edit_examples:
+        base_root = os.path.join(output_dir, "base_previews")
+        if len(glob.glob(os.path.join(base_root, "idx*.png"))) != len(edit_examples):
+            base_sheet = os.path.join(output_dir, "samples", "step000000_base.png")
+            do_preview("step000000_base")
+            slice_base_tiles(base_sheet, base_root, len(edit_examples))
+
     # ----- Resume: load weights (+TE) + optimizer + scheduler + RNG (+EMA), continue from step -----
     start_step = 0
     marker = resolve_resume_marker(cfg.paths.resume_from, ckpt_dir)
@@ -547,8 +579,8 @@ def main():
 
     steps = 20 if args.smoke else o.steps
     print(f"training {steps} steps (fused={fused}, optim_state={o.optimizer_state}, te_lr={te_lr})", flush=True)
-    # Step-0 baseline: render the untrained base model's samples so every later sheet is comparable.
-    if lg.sample_every and start_step == 0:
+    # Step-0 baseline for t2i previews (edit-mode base is handled before the resume load above).
+    if lg.sample_every and start_step == 0 and not edit_examples:
         do_preview("step000000_base")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()  # peak_gb = training peak, not the one-time model-load spike
