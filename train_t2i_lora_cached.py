@@ -86,7 +86,9 @@ def main():
         from quantize import quantize_dit_fp8   # frozen-base e4m3 -> ~half base VRAM (helps fit 16GB @1024)
         nq = quantize_dit_fp8(dit)
         print(f"fp8-quantized {nq} frozen base Linears (attn+mlp) -> ~half base VRAM", flush=True)
-    adapters = inject_lora(dit, lc.rank, lc.alpha, include_txtfusion=lc.target_txtfusion) \
+    adapters = inject_lora(dit, lc.rank, lc.alpha,
+                           include_txtfusion=lc.target_txtfusion,
+                           include_txtmlp=lc.target_txtmlp) \
         if lc.train_transformer else {}          # train_transformer=False -> TE-only (DiT frozen)
     # fp8 REQUIRES grad-ckpt: else the per-forward dequant is retained for backward across every layer,
     # erasing the saving (and OOM-ing). Force it on when fp8 is active.
@@ -225,7 +227,11 @@ def main():
         return v
 
     def _save_adapters(path, *, ema_tag=False):
-        meta = {"variant": lc.variant}
+        meta = {
+            "variant": lc.variant,
+            "target_txtfusion": int(lc.target_txtfusion),
+            "target_txtmlp": int(lc.target_txtmlp),
+        }
         if ema_tag:
             meta["ema"] = "1"
         if adapters:

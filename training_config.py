@@ -62,7 +62,8 @@ class LoraConfig:
   rank: int = 64
   alpha: float | None = None
   variant: str = "lora"        # lora | dora | loha | lokr
-  target_txtfusion: bool = False  # also adapt the text-fusion stage Linears
+  target_txtfusion: bool = True   # also adapt the text-fusion stage Linears
+  target_txtmlp: bool = True      # also adapt the text MLP projection Linears
   te_rank: int = 0             # TE-LoRA rank; 0 -> use rank
   train_transformer: bool = True  # TE trainer: also LoRA the DiT (False = DiT frozen, TE-only)
 

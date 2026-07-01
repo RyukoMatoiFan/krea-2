@@ -51,8 +51,9 @@ CUDA_VISIBLE_DEVICES=0 python train_t2i_lora_cached.py --config config/t2i_lora.
 ```
 Base DiT frozen bf16; only the injected adapters train (`lora.py`, standard AdamW). Adapters save in
 ai-toolkit/ComfyUI key format (`diffusion_model.<path>.lora_{A,B}.weight`) so a LoRA trained on Raw
-loads on Turbo. Tune `lora.rank` / `lora.alpha`; `lora.target_txtfusion: true` also adapts the
-text-fusion stage. Targets the attention `wq/wk/wv/wo/gate` + MLP `gate/up/down` per block.
+loads on Turbo. Tune `lora.rank` / `lora.alpha`; `lora.target_txtfusion` and `lora.target_txtmlp`
+default on to adapt the text-fusion and text-MLP stages. Targets the attention `wq/wk/wv/wo/gate`
+and MLP `gate/up/down` per block, plus the `txtmlp` projection Linears.
 
 ## 2c. Concept sliders
 

@@ -57,7 +57,8 @@ def main():
     device, dtype = cfg.runtime.device, dtype_of(cfg)
     s = cfg.slider
     res = int(cfg.data.resolution)
-    rank = int(cfg.lora.rank)
+    lc = cfg.lora
+    rank = int(lc.rank)
     steps = int(cfg.optim.steps)
     out_dir, ckpt_dir = cfg.paths.output_dir, cfg.paths.ckpt_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -128,7 +129,9 @@ def main():
         return dit(img=x_t, context=txt, t=t_vec, pos=pos, mask=mask).float()
 
     # 3) train
-    adapters = inject_lora(dit, rank=rank)
+    adapters = inject_lora(dit, rank=rank, alpha=lc.alpha,
+                           include_txtfusion=lc.target_txtfusion,
+                           include_txtmlp=lc.target_txtmlp)
     params = lora_parameters(adapters)
     opt = torch.optim.AdamW(params, lr=float(cfg.optim.lr))
     print(f"[slider] {len(adapters)} adapters, {sum(p.numel() for p in params)/1e6:.1f}M params", flush=True)
@@ -163,9 +166,11 @@ def main():
 
     name = (cfg.logging.run_name or "slider").replace("/", "_")
     out_lora = os.path.join(ckpt_dir, f"{name}_rank{rank}.safetensors")
-    save_lora(adapters, out_lora, rank=rank, alpha=float(rank),
+    save_lora(adapters, out_lora, rank=rank, alpha=lc.alpha or float(rank),
               metadata={"positive": s.positive, "negative": s.negative,
-                        "eta": s.eta, "infer_scale": s.infer_scale, "type": "krea2-slider"})
+                        "eta": s.eta, "infer_scale": s.infer_scale, "type": "krea2-slider",
+                        "target_txtfusion": int(lc.target_txtfusion),
+                        "target_txtmlp": int(lc.target_txtmlp)})
     print(f"[slider] saved {out_lora}", flush=True)
 
     # 4) multi-scale [-s|off|+s] sweep (scene should hold; attribute should slide monotonically)

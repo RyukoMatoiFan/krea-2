@@ -5,7 +5,8 @@ lora:
   rank: 32
   alpha: 32                # null -> defaults to rank
   variant: lora
-  target_txtfusion: false  # also adapt the text-fusion stage Linears
+  target_txtfusion: true   # also adapt the text-fusion stage Linears
+  target_txtmlp: true      # also adapt the text MLP projection Linears
 optim:
   lr: 1.0e-4
   steps: 3000

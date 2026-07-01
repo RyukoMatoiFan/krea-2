@@ -1,12 +1,12 @@
-"""LoRA adapters for the Krea 2 ``SingleStreamDiT`` (and optionally its text-fusion stage).
+"""LoRA adapters for the Krea 2 ``SingleStreamDiT`` and text-side projection layers.
 
 Custom (not PEFT) so saved adapters use the ai-toolkit / ComfyUI key convention
 ``diffusion_model.<module path>.lora_{A,B}.weight`` -> a LoRA trained on **Raw** loads directly on
 **Turbo** in ComfyUI (Krea's recommended "train on Raw, run on Turbo").
 
-Targeted Linears per block (names from mmdit.py): the attention q/k/v/out projections and the SwiGLU
-MLP gate/up/down. The base weight stays frozen bf16; adapters train in fp32 (``lora_B`` init 0 -> the
-adapter is a no-op at step 0).
+Targeted Linears per DiT/text-fusion block (names from mmdit.py): the attention q/k/v/out projections
+and the SwiGLU MLP gate/up/down. The text MLP projection stage is also adapted by default. The base
+weight stays frozen bf16; adapters train in fp32 (``lora_B`` init 0 -> the adapter is a no-op at step 0).
 """
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def _resolve(parent: nn.Module, dotted: str):
 
 
 def inject_lora(dit, rank: int, alpha: float | None = None, *, targets=DEFAULT_TARGETS,
-                include_txtfusion: bool = False) -> dict:
+                include_txtfusion: bool = True, include_txtmlp: bool = True) -> dict:
     """Freeze the DiT and wrap each target Linear with :class:`LoRALinear`. Returns {name: module}."""
     alpha = alpha if alpha is not None else float(rank)
     dit.requires_grad_(False)
@@ -102,6 +102,15 @@ def inject_lora(dit, rank: int, alpha: float | None = None, *, targets=DEFAULT_T
                 lora = LoRALinear(base, rank, alpha)
                 setattr(parent, leaf, lora)
                 adapters[f"{prefix}.{i}.{tgt}"] = lora
+    if include_txtmlp:
+        for name, base in list(dit.txtmlp.named_modules()):
+            if not name or not (isinstance(base, nn.Linear) or getattr(base, "is_quant_linear", False)):
+                continue
+            parent = dit.txtmlp.get_submodule(name.rsplit(".", 1)[0]) if "." in name else dit.txtmlp
+            leaf = name.rsplit(".", 1)[-1]
+            lora = LoRALinear(base, rank, alpha)
+            setattr(parent, leaf, lora)
+            adapters[f"txtmlp.{name}"] = lora
     if not adapters:
         raise RuntimeError("inject_lora matched no Linear targets; check target names vs mmdit.py")
     return adapters
@@ -188,22 +197,25 @@ def load_lora_weights(adapters: dict, path: str, *, key_prefix: str = "diffusion
 def load_lora(dit, path: str) -> dict:
     """Inject adapters matching a saved LoRA and load its weights (frozen, for inference).
 
-    Infers rank + target set + whether the text-fusion stage was adapted from the saved keys.
+    Infers rank + target set + whether text-side stages were adapted from the saved keys.
     """
     from safetensors.torch import load_file
 
     sd = load_file(path)
     rank = None
-    has_txt = False
+    has_txtfusion = False
+    has_txtmlp = False
     for k, v in sd.items():
         name = k[len("diffusion_model."):].rsplit(".lora_", 1)[0]
         if "txtfusion" in name:
-            has_txt = True
+            has_txtfusion = True
+        if "txtmlp" in name:
+            has_txtmlp = True
         if k.endswith("lora_A.weight") and rank is None:
             rank = v.shape[0]
     if rank is None:
         raise ValueError(f"no lora_A weights found in {path}")
-    adapters = inject_lora(dit, rank, include_txtfusion=has_txt)
+    adapters = inject_lora(dit, rank, include_txtfusion=has_txtfusion, include_txtmlp=has_txtmlp)
     missing = load_lora_weights(adapters, path)
     if missing:
         print(f"[load_lora] warning: {missing} injected adapters had no saved weights")
