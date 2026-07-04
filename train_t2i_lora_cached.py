@@ -129,7 +129,9 @@ def main():
             if edit_examples:
                 render_edit_previews(dit, vae, preview_encoder, edit_examples, out,
                                      res=cfg.data.resolution, steps=lg.sample_steps,
-                                     guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+                                     guidance=lg.sample_guidance, seed=cfg.runtime.seed,
+                                     vlm_cond=cfg.data.edit_vlm_cond,
+                                     vlm_image_size=cfg.data.vlm_image_size)
             else:
                 render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count], out,
                                 res=cfg.data.resolution, steps=lg.sample_steps,
@@ -155,7 +157,15 @@ def main():
         gh, gw = samples[0]["grid_h"], samples[0]["grid_w"]
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)
         if use_live_text:
-            ctx, mask = encoder([s["caption"] for s in samples])
+            caps = [s["caption"] for s in samples]
+            vlm_imgs = None
+            if cfg.data.edit_vlm_cond and samples[0].get("ref_paths"):
+                from PIL import Image
+
+                from sample_edit import _vlm_resize
+                vlm_imgs = [_vlm_resize(Image.open(s["ref_paths"][0]), cfg.data.vlm_image_size)
+                            for s in samples]
+            ctx, mask = encoder(caps, images=vlm_imgs)      # images=None -> text-only (unchanged)
             ctx, mask = ctx.to(device), mask.to(device)
         else:
             texts = [s["llm_text"] for s in samples]

@@ -145,14 +145,17 @@ def edit_training_step(
     t_override: float | None = None,
     disable_weighting: bool = False,
     loss_mask: Tensor | None = None,
+    ref_t0: bool = True,
 ) -> Tensor:
     """Flow step for edit / multi-reference: pack ``[text, refs(clean), target(noised)]``, loss on target.
 
     References are inserted as CLEAN latent tokens with their own rotary position blocks (via
-    ``ref_grids``); only the target is noised at ``t`` and supervised. No model change -- the DiT
-    outputs velocity for all image tokens and we slice the trailing target block. The model learns to
-    treat reference tokens as clean conditioning (in-context editing). ``ref_dropout_prob`` zeros the
-    reference tokens per-sample so a no-reference (text-only) branch is also learned for CFG.
+    ``ref_grids``); only the target is noised at ``t`` and supervised. The DiT outputs velocity for
+    all image tokens and we slice the trailing target block. ``ref_t0`` (default) tags the clean
+    reference tokens with a t=0 timestep modulation inside the DiT so it reads them as clean
+    conditioning (Kontext-style in-context edit); set False to modulate the reference tokens with the
+    sampled ``t`` instead. ``ref_dropout_prob`` zeros the reference tokens per-sample so a no-reference (text-only)
+    branch is also learned for CFG.
     """
     B, n_tgt, _ = z0.shape
     device = z0.device
@@ -189,7 +192,10 @@ def edit_training_step(
     img = torch.cat([*ref_tokens, x_t], dim=1)  # [refs..., target] along the sequence
     pos, mask = build_pos_mask(grid_h, grid_w, text_mask, ref_grids=ref_grids)
 
-    out = dit(img=img.to(dit_dtype(dit)), context=ctx.to(dit_dtype(dit)), t=t, pos=pos, mask=mask)
+    # Number of leading (clean) reference image tokens -> the DiT gives them t=0 modulation when ref_t0.
+    ref_len = sum(int(r.shape[1]) for r in ref_tokens) if ref_t0 else 0
+    out = dit(img=img.to(dit_dtype(dit)), context=ctx.to(dit_dtype(dit)), t=t, pos=pos, mask=mask,
+              ref_len=ref_len)
     pred_tgt = out[:, -n_tgt:].float()  # supervise only the trailing target tokens
     weight = None if disable_weighting else timestep_weight(
         t, flow_cfg.timestep_weighting, gamma=flow_cfg.min_snr_gamma)

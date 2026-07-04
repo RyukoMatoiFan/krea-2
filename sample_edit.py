@@ -26,11 +26,27 @@ from train_t2i import build_pos_mask
 from training_config import apply_runtime, dtype_of, load_config
 
 
+def _vlm_resize(im, max_side):
+    """Downscale (keep aspect) so the longest side <= ``max_side`` before the Qwen3-VL vision tower,
+    bounding VLM cost by shrinking the reference image ahead of encoding."""
+    im = im.convert("RGB")
+    w, h = im.size
+    s = max(w, h)
+    if s > max_side:
+        im = im.resize((max(1, round(w * max_side / s)), max(1, round(h * max_side / s))))
+    return im
+
+
 @torch.no_grad()
 def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", device="cuda",
                 dtype=torch.bfloat16, width=1024, height=1024, steps=28, guidance=4.5, seed=0,
-                minres=256, maxres=1280, y1=0.5, y2=1.15, mu=None):
-    """Denoise a single target conditioned on a text prompt + clean reference image(s)."""
+                minres=256, maxres=1280, y1=0.5, y2=1.15, mu=None,
+                ref_t0=True, vlm_cond=False, vlm_image_size=384):
+    """Denoise a single target conditioned on a text prompt + clean reference image(s).
+
+    ``ref_t0`` gives the clean reference tokens a t=0 modulation in the DiT (matches training).
+    ``vlm_cond`` also routes the (first) reference image through the Qwen3-VL vision tower into the
+    text embeddings (dual conditioning); the DiT must be trained with that on for it to help."""
     patch = model.config.patch
     align = vae.compression * patch
     width, height = roundup(width, align, "width"), roundup(height, align, "height")
@@ -51,11 +67,16 @@ def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", 
     x_t = patchify(noise, patch)            # (1, n_tgt, 64)
     n_tgt = x_t.shape[1]
 
+    # VLM dual conditioning: the (first) reference image also goes through the Qwen3-VL vision tower
+    # into the text embeddings. ``_forward_mm`` carries one image per prompt, so pass the primary
+    # source; all refs still ride along as clean latents above.
+    vlm_imgs = [_vlm_resize(ref_images[0], vlm_image_size)] if (vlm_cond and ref_images) else None
+
     cfg = guidance > 0
-    txt, txtmask = encoder([prompt])
+    txt, txtmask = encoder([prompt], images=vlm_imgs)
     pos, mask = build_pos_mask(glat_h, glat_w, txtmask, ref_grids=ref_grids)
     if cfg:
-        untxt, untxtmask = encoder([negative_prompt])
+        untxt, untxtmask = encoder([negative_prompt], images=vlm_imgs)
         unpos, unmask = build_pos_mask(glat_h, glat_w, untxtmask, ref_grids=ref_grids)
 
     # mu-shift uses the TARGET image-token count (matches get_schedule_for_seqlen in training).
@@ -63,9 +84,11 @@ def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", 
     x2 = (maxres // align) ** 2
     ts = timesteps(n_tgt, steps, x1, x2, y1=y1, y2=y2, mu=mu)
 
+    ref_len = sum(int(rt.shape[1]) for rt in ref_tokens) if ref_t0 else 0
+
     def velocity(context, p, m):
         img = torch.cat([*ref_tokens, x_t], dim=1)   # [refs(clean), target(noised)]
-        out = model(img=img.to(dtype), context=context.to(dtype), t=t, pos=p, mask=m)
+        out = model(img=img.to(dtype), context=context.to(dtype), t=t, pos=p, mask=m, ref_len=ref_len)
         return out[:, -n_tgt:].float()                # supervise only the trailing target
 
     for tcurr, tprev in zip(ts[:-1], ts[1:]):
@@ -102,6 +125,11 @@ def main():
     ap.add_argument("--width", type=int, default=1024)
     ap.add_argument("--height", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--vlm-cond", dest="vlm_cond", action="store_true",
+                    help="also route the source image through the Qwen3-VL vision tower (dual conditioning)")
+    ap.add_argument("--vlm-image-size", dest="vlm_image_size", type=int, default=384)
+    ap.add_argument("--no-ref-t0", dest="no_ref_t0", action="store_true",
+                    help="modulate reference tokens with the sampled t instead of t=0")
     ap.add_argument("--out", default="edit.png")
     args = ap.parse_args()
 
@@ -127,7 +155,9 @@ def main():
     img = edit_sample(dit, vae, encoder, args.prompt, refs, negative_prompt=args.negative,
                       device=device, dtype=dtype, width=args.width, height=args.height,
                       steps=args.steps, guidance=args.guidance, seed=args.seed,
-                      mu=args.mu, y1=args.y1, y2=args.y2)
+                      mu=args.mu, y1=args.y1, y2=args.y2,
+                      ref_t0=not args.no_ref_t0, vlm_cond=args.vlm_cond,
+                      vlm_image_size=args.vlm_image_size)
     img.save(args.out)
     print("saved", args.out, flush=True)
 

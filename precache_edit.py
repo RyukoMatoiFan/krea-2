@@ -16,7 +16,7 @@ Manifest line (path keys relative to --data-root, or absolute):
 
 Cache payload per example (``<idx:06d>.pt``):
   {"z_tgt": (n_tgt,64) bf16, "grid_h", "grid_w", "idx", "caption", "src",
-   "refs": [{"tokens": (n_ref,64) bf16, "grid_h", "grid_w"}, ...],
+   "refs": [{"tokens": (n_ref,64) bf16, "grid_h", "grid_w"}, ...], "ref_paths": [abs src path, ...],
    ["llm_text": (n_text,12,2560) bf16]}
 """
 from __future__ import annotations
@@ -128,7 +128,8 @@ def main() -> None:
             continue
 
         payload = {"z_tgt": z_tgt, "grid_h": gh, "grid_w": gw, "idx": idx,
-                   "caption": caption, "src": os.path.abspath(tgt), "refs": ref_payload}
+                   "caption": caption, "src": os.path.abspath(tgt), "refs": ref_payload,
+                   "ref_paths": [os.path.abspath(r) for r in refs]}  # source pixels for optional VLM cond
         if args.cache_text:
             hiddens, mask = encoder([caption])
             payload["llm_text"] = hiddens[0][mask[0]].to(torch.bfloat16).cpu()

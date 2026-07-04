@@ -240,7 +240,8 @@ def render_previews(dit, vae, encoder, prompts, out_path, *, res, steps, guidanc
         torch.cuda.empty_cache()
 
 
-def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, guidance, seed):
+def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, guidance, seed,
+                         vlm_cond=False, vlm_image_size=384):
     """Edit contact-sheet: one row per example, columns [source | model edit | target (if given)].
 
     ``examples`` = list of {"src": path, "instruction": str, "tgt": path?}. Rendered at the training
@@ -257,7 +258,8 @@ def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, g
         for ex in examples:
             src = Image.open(ex["src"]).convert("RGB")
             edited = edit_sample(dit, vae, encoder, ex["instruction"], [src],
-                                 width=res, height=res, steps=steps, guidance=guidance, seed=seed)
+                                 width=res, height=res, steps=steps, guidance=guidance, seed=seed,
+                                 vlm_cond=vlm_cond, vlm_image_size=vlm_image_size)
             cells = [src.resize((res, res)), edited]
             if ex.get("tgt") and os.path.exists(ex["tgt"]):
                 cells.append(Image.open(ex["tgt"]).convert("RGB").resize((res, res)))
@@ -376,7 +378,9 @@ def main():
             if edit_examples:
                 render_edit_previews(dit, vae, preview_encoder, edit_examples, out,
                                      res=cfg.data.resolution, steps=lg.sample_steps,
-                                     guidance=lg.sample_guidance, seed=cfg.runtime.seed)
+                                     guidance=lg.sample_guidance, seed=cfg.runtime.seed,
+                                     vlm_cond=cfg.data.edit_vlm_cond,
+                                     vlm_image_size=cfg.data.vlm_image_size)
             else:
                 render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count], out,
                                 res=cfg.data.resolution, steps=lg.sample_steps,
@@ -449,7 +453,14 @@ def main():
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)  # (B,n,64)
         if use_live_text:
             caps = [s["caption"] for s in samples]
-            ctx, mask = encoder(caps)                       # (B,L,12,2560), (B,L)
+            vlm_imgs = None
+            if cfg.data.edit_vlm_cond and samples[0].get("ref_paths"):
+                from PIL import Image
+
+                from sample_edit import _vlm_resize
+                vlm_imgs = [_vlm_resize(Image.open(s["ref_paths"][0]), cfg.data.vlm_image_size)
+                            for s in samples]
+            ctx, mask = encoder(caps, images=vlm_imgs)      # (B,L,12,2560), (B,L); images=None -> text-only
             ctx = ctx.to(device)
             mask = mask.to(device)
         else:

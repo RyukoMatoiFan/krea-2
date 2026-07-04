@@ -436,14 +436,21 @@ class SingleStreamDiT(nn.Module):
         mask: Tensor | None = None,
         attn_mask_override: Tensor | None = None,
         txt_attn_override: Tensor | None = None,
+        ref_len: int = 0,
     ) -> Tensor:
         # ``attn_mask_override`` / ``txt_attn_override`` are OPT-IN regional-attention masks
         # (bool, (B,1,L,L) / (B,1,txtlen,txtlen)) ANDed onto the default key-padding mask to route
         # image regions to their own text segment. Both default None -> the standard path below is
         # byte-identical; only sampling.sample_regions sets them.
+        #
+        # ``ref_len`` > 0 = in-context edit: the FIRST ``ref_len`` image tokens are CLEAN reference
+        # latents (packed by ``edit_training_step`` / ``edit_sample`` as ``[refs, target]``). They get
+        # a t=0 timestep modulation so the DiT reads them as clean conditioning (Kontext-style), while
+        # text + the noised target keep the sampled ``t``. Default 0 -> single-``t`` path, byte-identical
+        # (so t2i / style are untouched).
         img = self.first(img)
-        t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
-        tvec = self.tproj(t)
+        t_hidden = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
+        tvec = self.tproj(t_hidden)
 
         txtmask = _mask(mask[:, : context.shape[1]])
         if txt_attn_override is not None:
@@ -471,6 +478,19 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.posemb(pos)
 
+        # Per-token timestep modulation for in-context edit: clean reference image tokens see t=0.
+        # ``tvec`` broadcasts (B,1,6f) across all tokens by default; here we expand to (B,L,6f) and
+        # overwrite the reference band [txtlen : txtlen+ref_len] with the t=0 projection. The block's
+        # DoubleSharedModulation consumes (B,L,6f) unchanged (adds its bias, chunks on dim=-1). Trailing
+        # pad tokens keep ``t`` — irrelevant (masked as keys, sliced off the output).
+        if ref_len:
+            B = combined.shape[0]
+            t0 = torch.zeros_like(t)
+            tvec0 = self.tproj(self.tmlp(temb(t0, self.config.tdim, device=img.device, dtype=img.dtype)))
+            tok = tvec.expand(B, combined.shape[1], tvec.shape[-1]).contiguous()
+            tok[:, txtlen: txtlen + ref_len, :] = tvec0.expand(B, ref_len, tvec0.shape[-1])
+            tvec = tok
+
         swap = self._swap_blocks
         for i, block in enumerate(self.blocks):
             swapped = i in swap
@@ -495,7 +515,7 @@ class SingleStreamDiT(nn.Module):
                         # No recompute here: keep weights resident through backward, free after.
                         inp.register_hook(self._mk_post_bwd_offload(block))
 
-        final = self.last(combined, t)
+        final = self.last(combined, t_hidden)
         output = final[:, txtlen : txtlen + imglen, :]
 
         return output

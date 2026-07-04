@@ -83,6 +83,8 @@ class DataConfig:
   mask_quantile: float = 0.5
   mask_bg_weight: float = 0.0
   ref_dropout_prob: float = 0.0    # (edit/multiref/style) per-sample reference dropout for CFG on refs
+  edit_vlm_cond: bool = False      # (edit) also feed the source image through the Qwen3-VL vision tower
+  vlm_image_size: int = 384        # max source-image side for the VLM conditioning path
   train_list: str = ""             # JSON list of cache filenames (repeats = oversampling)
   aspect_bucketing: bool = False   # precache at nearest-AR bucket instead of square-squash
   bucket_pixels: int = 0           # target area for buckets; 0 -> resolution^2
