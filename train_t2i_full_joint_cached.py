@@ -27,7 +27,7 @@ import torch
 from fused_adamw import build_fused_adafactor, build_fused_adamw
 from loading import build_dit, build_encoder, build_vae
 from scheduler import get_schedule_for_seqlen
-from train_t2i import edit_training_step, t2i_training_step
+from train_t2i import edit_training_step, encode_text_with_ref_dropout, t2i_training_step
 from trackers import Tracker
 from training_config import apply_runtime, dtype_of, load_config
 from training_utils import (
@@ -446,11 +446,17 @@ def main():
     tracker = Tracker(lg.tracker, project=lg.wandb_project, run_name=lg.run_name or None,
                       out_dir=output_dir)
 
-    def collate(paths):
-        """Build (z0, context, text_mask, grid_h, grid_w, refs, ref_grids) for a grid-homogeneous batch."""
+    def collate(paths, drop_refs=False):
+        """Build (z0, context, text_mask, grid_h, grid_w, refs, ref_grids, ref_drop) for a grid-homogeneous batch.
+
+        ``drop_refs`` (train batches only): with VLM dual conditioning, reference dropout is decided
+        HERE so the text encoding agrees with the latent refs — dropped samples are encoded text-only
+        and the mask is returned as ``ref_drop`` for ``edit_training_step``. Validation keeps it off.
+        """
         samples = [load_sample(p, device) for p in paths]
         gh, gw = samples[0]["grid_h"], samples[0]["grid_w"]
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)  # (B,n,64)
+        ref_drop = None
         if use_live_text:
             caps = [s["caption"] for s in samples]
             vlm_imgs = None
@@ -460,7 +466,11 @@ def main():
                 from sample_edit import _vlm_resize
                 vlm_imgs = [_vlm_resize(Image.open(s["ref_paths"][0]), cfg.data.vlm_image_size)
                             for s in samples]
-            ctx, mask = encoder(caps, images=vlm_imgs)      # (B,L,12,2560), (B,L); images=None -> text-only
+            if vlm_imgs is not None and drop_refs and cfg.data.ref_dropout_prob > 0.0:
+                ref_drop = torch.rand(len(samples)) < cfg.data.ref_dropout_prob
+                ctx, mask = encode_text_with_ref_dropout(encoder, caps, vlm_imgs, ref_drop)
+            else:
+                ctx, mask = encoder(caps, images=vlm_imgs)  # (B,L,12,2560), (B,L); images=None -> text-only
             ctx = ctx.to(device)
             mask = mask.to(device)
         else:
@@ -479,12 +489,12 @@ def main():
             ref_grids = [(r["grid_h"], r["grid_w"]) for r in samples[0]["refs"]]
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]
-        return z0, ctx, mask, gh, gw, refs, ref_grids
+        return z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop
 
     def sample_batch():
         key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
         files = train_by_bucket[key]
-        return collate([rng.choice(files) for _ in range(o.batch)])
+        return collate([rng.choice(files) for _ in range(o.batch)], drop_refs=True)
 
     # ----- EMA (CPU fp32 shadow of the trained DiT weights; zero extra VRAM) -----
     ema = None
@@ -513,7 +523,7 @@ def main():
                     batches.append(((collate(chunk), vsched), len(chunk)))
 
             def loss_fn(packed, q):
-                (z0, ctx, mask, gh, gw, refs, ref_grids), vsched = packed
+                (z0, ctx, mask, gh, gw, refs, ref_grids, _), vsched = packed
                 t = float(vsched(torch.tensor([float(q)])).item())
                 g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
                 if refs is not None:
@@ -603,7 +613,7 @@ def main():
 
     for step in range(start_step, steps):
         _state["step"] = step
-        z0, ctx, mask, gh, gw, refs, ref_grids = sample_batch()
+        z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop = sample_batch()
         schedule = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
                                            max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
                                            max_seq_len=fl.max_image_seq_len)
@@ -616,7 +626,8 @@ def main():
             loss = edit_training_step(dit, z0=z0, refs=refs, ref_grids=ref_grids, context=ctx,
                                       text_mask=mask, grid_h=gh, grid_w=gw, schedule=schedule,
                                       flow_cfg=fl, generator=gen, cfg_dropout_prob=o.cfg_dropout_prob,
-                                      ref_dropout_prob=cfg.data.ref_dropout_prob, loss_mask=lmask)
+                                      ref_dropout_prob=cfg.data.ref_dropout_prob, loss_mask=lmask,
+                                      ref_drop_mask=ref_drop)
         else:
             loss = t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
                                      schedule=schedule, flow_cfg=fl, generator=gen,

@@ -97,6 +97,23 @@ class Qwen3VLConditioner(torch.nn.Module):
 
             return hiddens, mask
 
+    def _patch_vision_patch_embed(self) -> int:
+        """The vision tower's patch_embed is a Conv3d whose kernel == stride, i.e. a plain linear
+        projection of each flattened patch. bf16 Conv3d has no fast cuDNN kernel and falls back to a
+        slow path, so route it through the equivalent F.linear (a GEMM). The weight is read lazily so
+        the patch survives later .to(device/dtype) moves. Returns the number of modules patched."""
+        patched = 0
+        for module in self.qwen.modules():
+            proj = getattr(module, "proj", None)
+            if isinstance(proj, torch.nn.Conv3d) and tuple(proj.kernel_size) == tuple(proj.stride):
+                def fast_forward(hidden_states, _proj=proj):
+                    w = _proj.weight.reshape(_proj.weight.shape[0], -1)
+                    x = hidden_states.view(-1, w.shape[1]).to(w.dtype)
+                    return torch.nn.functional.linear(x, w, _proj.bias)
+                module.forward = fast_forward
+                patched += 1
+        return patched
+
     def _forward_mm(self, text, images) -> tuple[Tensor, Tensor]:
         """Condition on reference image(s) via the Qwen3-VL vision tower.
 
@@ -111,6 +128,7 @@ class Qwen3VLConditioner(torch.nn.Module):
 
         if self._mm_processor is None:
             self._mm_processor = AutoProcessor.from_pretrained(self._version)
+            self._patch_vision_patch_embed()
         if not isinstance(images, (list, tuple)):
             images = [images] * len(text)
         chats = [

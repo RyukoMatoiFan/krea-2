@@ -36,8 +36,9 @@ def build_pos_mask(
     """Build combined ``pos`` (B, S, 3) and ``mask`` (B, S) for ``[text][refs...][target]``.
 
     ``text_mask`` is (B, L) bool. Image tokens are all valid. Image position ids carry their
-    latent-grid coords on axes (1, 2); axis 0 (temporal) is 0 for t2i, and is bumped per reference
-    so reference grids never collide with the target grid (edit/multiref use this).
+    latent-grid coords on axes (1, 2); axis 0 (temporal) is 0 for the TARGET (same frame the base
+    t2i model generates at, preserving its positional prior) and i+1 for reference i, so reference
+    grids never collide with the target grid (edit/multiref use this — Kontext-style indexing).
     """
     B, L = text_mask.shape
     device = text_mask.device
@@ -45,9 +46,10 @@ def build_pos_mask(
 
     pos_blocks = [torch.zeros(L, 3, device=device)]  # text at origin
     mask_blocks = [text_mask]
-    for t_idx, (gh, gw) in enumerate(grids):
+    n_ref = len(grids) - 1  # the target grid is always last
+    for j, (gh, gw) in enumerate(grids):
         ids = torch.zeros((gh, gw, 3), device=device)
-        ids[..., 0] = t_idx  # temporal/stream index: 0 = target for plain t2i
+        ids[..., 0] = 0 if j == n_ref else j + 1  # temporal/stream index: target -> 0, ref i -> i+1
         ids[..., 1] = torch.arange(gh, device=device)[:, None]
         ids[..., 2] = torch.arange(gw, device=device)[None, :]
         pos_blocks.append(ids.reshape(gh * gw, 3))
@@ -56,6 +58,37 @@ def build_pos_mask(
     pos = torch.cat(pos_blocks, dim=0).unsqueeze(0).expand(B, -1, -1)  # (B, S, 3)
     mask = torch.cat(mask_blocks, dim=1)                              # (B, S)
     return pos, mask
+
+
+def encode_text_with_ref_dropout(encoder, caps, vlm_imgs, drop_mask):
+    """Encode captions with per-sample VLM source-image conditioning, honoring reference dropout.
+
+    ``drop_mask`` (B,) bool: True samples are encoded WITHOUT the source image, so the no-reference
+    branch carries no source signal through the text-encoder vision tokens. Pass the same mask to
+    ``edit_training_step`` as ``ref_drop_mask`` so the latent refs are zeroed for the SAME samples —
+    otherwise a "no-ref" sample would still see the source through the text conditioning. The two
+    sub-batches (with / without image) are encoded separately and right-pad-merged back into the
+    original order. Returns ``(ctx (B, L, 12, d), mask (B, L) bool)``.
+    """
+    keep = [i for i in range(len(caps)) if not bool(drop_mask[i])]
+    drop = [i for i in range(len(caps)) if bool(drop_mask[i])]
+    outs: dict = {}
+    if keep:
+        ctx_k, m_k = encoder([caps[i] for i in keep], images=[vlm_imgs[i] for i in keep])
+        for j, i in enumerate(keep):
+            outs[i] = (ctx_k[j], m_k[j])
+    if drop:
+        ctx_d, m_d = encoder([caps[i] for i in drop])
+        for j, i in enumerate(drop):
+            outs[i] = (ctx_d[j], m_d[j])
+    L = max(v[0].shape[0] for v in outs.values())
+    c0 = outs[next(iter(outs))][0]
+    ctx = torch.zeros(len(caps), L, *c0.shape[1:], dtype=c0.dtype, device=c0.device)
+    mask = torch.zeros(len(caps), L, dtype=torch.bool, device=c0.device)
+    for i, (c, m) in outs.items():
+        ctx[i, : c.shape[0]] = c
+        mask[i, : m.shape[0]] = m.to(torch.bool)
+    return ctx, mask
 
 
 def sample_timesteps(schedule, bsz: int, device, generator=None) -> Tensor:
@@ -146,6 +179,7 @@ def edit_training_step(
     disable_weighting: bool = False,
     loss_mask: Tensor | None = None,
     ref_t0: bool = True,
+    ref_drop_mask: Tensor | None = None,
 ) -> Tensor:
     """Flow step for edit / multi-reference: pack ``[text, refs(clean), target(noised)]``, loss on target.
 
@@ -155,7 +189,9 @@ def edit_training_step(
     reference tokens with a t=0 timestep modulation inside the DiT so it reads them as clean
     conditioning (Kontext-style in-context edit); set False to modulate the reference tokens with the
     sampled ``t`` instead. ``ref_dropout_prob`` zeros the reference tokens per-sample so a no-reference (text-only)
-    branch is also learned for CFG.
+    branch is also learned for CFG. ``ref_drop_mask`` (B,) bool overrides the internal draw — used when
+    the caller already decided the dropout (VLM dual conditioning: the text encoding for dropped samples
+    must also exclude the source image, see ``encode_text_with_ref_dropout``).
     """
     B, n_tgt, _ = z0.shape
     device = z0.device
@@ -182,12 +218,15 @@ def edit_training_step(
             ctx[drop] = 0
 
     ref_tokens = [r.float() for r in refs]
-    if ref_dropout_prob > 0.0 and ref_tokens:
+    rdrop = None
+    if ref_drop_mask is not None:
+        rdrop = ref_drop_mask.to(device=device, dtype=torch.bool)
+    elif ref_dropout_prob > 0.0 and ref_tokens:
         rdrop = torch.rand(B, device=device, generator=generator) < ref_dropout_prob
-        if rdrop.any():
-            ref_tokens = [r.clone() for r in ref_tokens]
-            for r in ref_tokens:
-                r[rdrop] = 0
+    if rdrop is not None and ref_tokens and rdrop.any():
+        ref_tokens = [r.clone() for r in ref_tokens]
+        for r in ref_tokens:
+            r[rdrop] = 0
 
     img = torch.cat([*ref_tokens, x_t], dim=1)  # [refs..., target] along the sequence
     pos, mask = build_pos_mask(grid_h, grid_w, text_mask, ref_grids=ref_grids)
