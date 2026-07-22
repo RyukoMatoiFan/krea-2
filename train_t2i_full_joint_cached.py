@@ -63,12 +63,14 @@ DEFAULT_PREVIEWS = [
 # --------------------------------------------------------------------------- #
 # Cache dataset (bucketed by latent grid)
 # --------------------------------------------------------------------------- #
-def index_caches(cache_dir, n_eval, train_list=""):
-    """Return (train_by_bucket: {(gh,gw): [paths]}, eval_paths). Eval holdout = idx < n_eval.
+def index_caches(cache_dir, n_eval, train_list="", eval_list=""):
+    """Return (train_by_bucket: {(gh,gw): [paths]}, eval_paths).
 
     ``train_list`` (optional): path to a JSON list of cache filenames; repeated names **oversample**.
     When given, the TRAIN set is built from that list (bucketed by latent grid); otherwise from every
-    non-eval cache. The eval holdout is always ``idx < n_eval`` from the full cache dir.
+    non-eval cache. ``eval_list`` (optional): explicit JSON list of held-out cache filenames; use it
+    to hold out a mix that ``idx < n_eval`` cannot express (e.g. spanning several appended datasets).
+    Otherwise the eval holdout is ``idx < n_eval`` from the cache dir. Train excludes the eval names.
     """
     files = sorted(glob.glob(os.path.join(cache_dir, "[0-9]" * 6 + ".pt")))
     if not files:
@@ -94,12 +96,20 @@ def index_caches(cache_dir, n_eval, train_list=""):
             json.dump(bindex, f)
         os.replace(tmp, idx_path)
 
-    eval_paths = [p for p in files if int(os.path.basename(p)[:6]) < n_eval]
+    if eval_list:
+        with open(eval_list, "r", encoding="utf-8") as f:
+            eval_names = {os.path.basename(n) for n in json.load(f)}
+        eval_paths = [p for p in files if os.path.basename(p) in eval_names]
+    else:
+        eval_names = {os.path.basename(p) for p in files
+                      if int(os.path.basename(p)[:6]) < n_eval}
+        eval_paths = [p for p in files if os.path.basename(p) in eval_names]
     if train_list:
         with open(train_list, "r", encoding="utf-8") as f:
-            names = [os.path.basename(n) for n in json.load(f)]   # repeats -> oversampling
+            names = [os.path.basename(n) for n in json.load(f)   # repeats -> oversampling
+                     if os.path.basename(n) not in eval_names]
     else:
-        names = [os.path.basename(p) for p in files if int(os.path.basename(p)[:6]) >= n_eval]
+        names = [os.path.basename(p) for p in files if os.path.basename(p) not in eval_names]
     train = {}
     for name in names:
         rec = bindex.get(name)
@@ -327,7 +337,8 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     train_by_bucket, eval_paths = index_caches(cfg.paths.cache_dir, cfg.data.n_eval_holdout,
-                                               train_list=cfg.data.train_list)
+                                               train_list=cfg.data.train_list,
+                                               eval_list=cfg.data.eval_list)
     bucket_keys = list(train_by_bucket)
     bucket_weights = [len(train_by_bucket[k]) for k in bucket_keys]
     n_train = sum(bucket_weights)
@@ -844,7 +855,10 @@ def main():
                                            max_seq_len=fl.max_image_seq_len)
         if refs is not None:
             lmask = None
-            if cfg.data.masked_loss and refs[0].shape[1] == z0.shape[1]:
+            # The edit mask is derived from |ref0 - target|, which localises the edit only when ref0
+            # IS the source being edited -- true for single-reference editing, not for multi-reference
+            # composition where ref0 may be an inserted object. So restrict masked loss to single-ref.
+            if cfg.data.masked_loss and len(refs) == 1 and refs[0].shape[1] == z0.shape[1]:
                 lmask = derive_edit_mask(refs[0], z0, quantile=cfg.data.mask_quantile)
                 if cfg.data.mask_bg_weight:
                     lmask = lmask + (1.0 - lmask) * cfg.data.mask_bg_weight

@@ -96,6 +96,7 @@ class DataConfig:
   edit_vlm_cond: bool = False      # (edit) also feed the source image through the Qwen3-VL vision tower
   vlm_image_size: int = 384        # max source-image side for the VLM conditioning path
   train_list: str = ""             # JSON list of cache filenames (repeats = oversampling)
+  eval_list: str = ""              # JSON list of held-out cache filenames (else idx < n_eval_holdout)
   aspect_bucketing: bool = False   # precache at nearest-AR bucket instead of square-squash
   bucket_pixels: int = 0           # target area for buckets; 0 -> resolution^2
   num_buckets: int = 9
