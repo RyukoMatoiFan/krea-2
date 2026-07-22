@@ -6,7 +6,7 @@ Single-GPU:
     CUDA_VISIBLE_DEVICES=0 python train_t2i_full_joint_cached.py --config config/t2i_full.yaml [--smoke]
 
 The memory recipe (fused per-parameter backward + on-GPU Adafactor + gradient checkpointing + bf16
-stochastic rounding) fits the 12B DiT (+ optional 4B TE) on one 80GB GPU. See fused_adamw.py.
+stochastic rounding) fits the DiT (+ optional TE) on a single GPU. See fused_adamw.py.
 
 Two text paths, auto-selected:
   * cached  : caches hold ``llm_text`` and we are not training the TE -> DiT-only FFT, no encoder in loop.
@@ -19,15 +19,21 @@ import glob
 import json
 import os
 import random
+import shutil
 import signal
 import time
 
 import torch
 
 from fused_adamw import build_fused_adafactor, build_fused_adamw
+from eval_control import (BestTracker, load_scorer, parse_criteria,
+                          parse_eval_steps, parse_guardrails)
 from loading import build_dit, build_encoder, build_vae
+from lora import inject_lora_te, load_lora_weights, save_lora
+from provenance import write_manifest
 from scheduler import get_schedule_for_seqlen
-from train_t2i import edit_training_step, encode_text_with_ref_dropout, t2i_training_step
+from train_t2i import (edit_training_step, encode_text_with_ref_dropout,
+                        permute_reference_order, t2i_training_step)
 from trackers import Tracker
 from training_config import apply_runtime, dtype_of, load_config
 from training_utils import (
@@ -136,14 +142,14 @@ def home_volume_guard(path):
             raise SystemExit(f"refusing to write checkpoints under {bad} ({ap}); use a data volume")
 
 
-def save_ckpt(model, ckpt_dir, tag, step, keep_last, *, prefix="dit"):
+def save_ckpt(model, ckpt_dir, tag, step, keep_last, *, prefix="dit", extra_meta=None):
     from safetensors.torch import save_file
 
     os.makedirs(ckpt_dir, exist_ok=True)
     sd = {k: v.detach().to(torch.bfloat16).cpu().contiguous() for k, v in model.state_dict().items()}
     out = os.path.join(ckpt_dir, f"{prefix}_{tag}.safetensors")
     tmp = out + ".tmp"
-    save_file(sd, tmp, metadata={"step": str(step)})
+    save_file(sd, tmp, metadata={"step": str(step), **(extra_meta or {})})
     os.replace(tmp, out)
     # rotate step-tagged ckpts (named tags like 'final'/'interrupt' are kept)
     import re
@@ -315,7 +321,7 @@ def main():
     cfg = load_config(args.config)
     apply_runtime(cfg)
     device, dtype = cfg.runtime.device, dtype_of(cfg)
-    o, fl, lg = cfg.optim, cfg.flow, cfg.logging
+    o, fl, lg, lc = cfg.optim, cfg.flow, cfg.logging, cfg.lora
     output_dir, ckpt_dir = cfg.paths.output_dir, cfg.paths.ckpt_dir
     home_volume_guard(ckpt_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -354,10 +360,65 @@ def main():
               f"(skip_trainable={not o.train_dit})", flush=True)
     encoder = None
     preview_encoder = None
+    te_adapters = {}
     if use_live_text:
+        # train=True keeps gradients flowing THROUGH the encoder forward; for TE-LoRA the base is then
+        # frozen by inject_lora_te and only the fresh adapter params stay trainable (so the
+        # requires_grad param-group filter below picks up exactly the adapters).
         encoder = build_encoder(cfg, device, dtype, train=train_te)
+        _te_mode = str(o.te_mode).strip().lower()
+        if _te_mode not in ("full", "lora"):
+            # Silently falling back to full fine-tuning on a typo would swap the experiment arm
+            # (and the checkpoint size) without any signal.
+            raise SystemExit(f"optim.te_mode must be 'full' or 'lora', got {o.te_mode!r}")
+        if train_te and _te_mode == "lora":
+            te_adapters = inject_lora_te(encoder.qwen, lc.te_rank or lc.rank, lc.alpha)
+            encoder.qwen.train()
+            print(f"TE-LoRA: injected {len(te_adapters)} adapters (Qwen3-VL base frozen, "
+                  f"rank={lc.te_rank or lc.rank})", flush=True)
+        # Weights-only TE warm start (no optimizer/scheduler state, unlike resume_from).
+        if cfg.paths.te_init:
+            from safetensors.torch import load_file as _load_te
+
+            sd = _load_te(cfg.paths.te_init)
+            is_lora_ckpt = any(".lora_A" in k or ".lora_B" in k for k in sd)
+            if is_lora_ckpt != bool(te_adapters):
+                raise SystemExit(
+                    f"te_init mismatch: checkpoint is {'TE-LoRA' if is_lora_ckpt else 'full-TE'} but "
+                    f"te_mode={'lora' if te_adapters else 'full'}. Loading one as the other would "
+                    f"silently discard the weights (strict=False ignores unknown keys).")
+            if te_adapters:
+                # load_lora_weights returns the number of adapters that had NO saved weights
+                # (0 == clean load), NOT the number restored.
+                missing = load_lora_weights(te_adapters, cfg.paths.te_init,
+                                            key_prefix="text_encoder")
+                if missing:
+                    raise SystemExit(
+                        f"te_init: {missing}/{len(te_adapters)} adapters had no saved weights in "
+                        f"{os.path.basename(cfg.paths.te_init)} -- refusing to start with "
+                        f"partially random adapters (wrong checkpoint, or rank/targets changed).")
+                print(f"TE warm start: {len(te_adapters)} LoRA adapters from "
+                      f"{os.path.basename(cfg.paths.te_init)}", flush=True)
+            else:
+                r = encoder.qwen.load_state_dict(sd, strict=False)
+                nunexp = len(getattr(r, "unexpected_keys", []) or [])
+                nmiss = len(getattr(r, "missing_keys", []) or [])
+                if nunexp:
+                    raise SystemExit(f"te_init has {nunexp} unexpected keys -- refusing a silently "
+                                     f"ignored warm start ({cfg.paths.te_init})")
+                # save_ckpt writes the FULL encoder state_dict, so a correct te_init has ZERO
+                # missing keys. Anything missing means a truncated/mismatched file whose remaining
+                # weights would stay randomly initialised -- printing that was not enough.
+                if nmiss:
+                    raise SystemExit(
+                        f"te_init is missing {nmiss} keys ({cfg.paths.te_init}); the rest of the "
+                        f"encoder would keep its initial weights. Refusing a partial warm start.")
+                print(f"TE warm start: full encoder from "
+                      f"{os.path.basename(cfg.paths.te_init)} (complete)", flush=True)
         preview_encoder = encoder
-    need_preview = bool(lg.sample_every) or args.smoke
+    # eval_steps can request a render independently of sample_every; without this the preview
+    # resources are never built, do_preview() silently no-ops, and the scorer sees a missing sheet.
+    need_preview = bool(lg.sample_every) or args.smoke or bool(str(lg.eval_steps).strip())
     vae = build_vae(cfg, device, dtype) if need_preview else None
     if need_preview and preview_encoder is None:
         # DiT-only training (cached text): still need a frozen encoder to render previews.
@@ -398,7 +459,7 @@ def main():
         raise SystemExit("nothing to train (train_dit=False and train_te=False)")
 
     if o.optimizer_state == "adafactor":
-        opt = build_fused_adafactor(groups, lr=o.lr)
+        opt = build_fused_adafactor(groups, lr=o.lr, weight_decay=o.weight_decay)
     else:
         opt = build_fused_adamw(groups, lr=o.lr, weight_decay=o.weight_decay,
                                 offload_states=o.offload_optimizer)
@@ -415,6 +476,13 @@ def main():
     # Folded into the interval mean at each log flush -> per-group learning-signal metric
     # (e.g. te_grad_norm shows the jointly-trained TE is actually receiving/using gradient).
     gstep = {"dit": 0.0, "te": 0.0}
+    # Parameters whose gradient arrived non-finite and were therefore NOT updated this step. A
+    # partial update is silent in the loss and shows only as a slightly lower grad-norm, so it is
+    # counted explicitly and reported.
+    gskip = {"n": 0}
+    partial_streak = {"n": 0}
+    n_partial_steps = 0            # cumulative, reported in metrics
+    PARTIAL_STREAK_ABORT = 20      # consecutive partial-update steps tolerated before aborting
 
     # Fused per-parameter backward (accum==1): step + free each grad as it lands.
     fused = (o.accum == 1)
@@ -428,6 +496,15 @@ def main():
                     # opt.param_groups keeps step_parameter on the scheduler-updated group.
                     g = opt.param_groups[gidx]
                     if param.grad is None or not torch.isfinite(param.grad).all():
+                        # A FINITE scalar loss can still produce non-finite bf16 grads for SOME
+                        # parameters. Those are skipped while parameters whose grads arrived
+                        # earlier have ALREADY been updated, so one logical step updates an
+                        # arbitrary subset of the model while the LR scheduler advances normally.
+                        # True atomicity is impossible here (the fused backward frees each grad on
+                        # arrival, which is what keeps peak memory low), so instead: COUNT it, surface
+                        # it in metrics, and abort on a sustained problem rather than drift silently.
+                        gskip["n"] += 1
+                        gskip[nm] = gskip.get(nm, 0) + 1
                         param.grad = None
                         return
                     # clip_grad_norm_ already returns the pre-clip norm -> capture it for free.
@@ -454,6 +531,23 @@ def main():
         and the mask is returned as ``ref_drop`` for ``edit_training_step``. Validation keeps it off.
         """
         samples = [load_sample(p, device) for p in paths]
+        # Reference-order augmentation: permute a sample's references AND rewrite its caption's
+        # image_k mentions together, so the ordinal stays truthful while the slot layout varies.
+        if cfg.data.ref_permute_prob > 0.0 and samples[0].get("refs"):
+            for _i, _s in enumerate(samples):
+                _n = len(_s["refs"])
+                if _n < 2 or rng.random() >= cfg.data.ref_permute_prob:
+                    continue
+                _perm = list(range(_n))
+                rng.shuffle(_perm)
+                if _perm == list(range(_n)):
+                    continue
+                _s = dict(_s)                                   # never mutate the cached payload
+                _s["refs"] = [_s["refs"][j] for j in _perm]
+                if _s.get("ref_paths"):
+                    _s["ref_paths"] = [_s["ref_paths"][j] for j in _perm]
+                _s["caption"] = permute_reference_order(_s["caption"], _n, _perm)
+                samples[_i] = _s
         gh, gw = samples[0]["grid_h"], samples[0]["grid_w"]
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)  # (B,n,64)
         ref_drop = None
@@ -464,8 +558,12 @@ def main():
                 from PIL import Image
 
                 from sample_edit import _vlm_resize
-                vlm_imgs = [_vlm_resize(Image.open(s["ref_paths"][0]), cfg.data.vlm_image_size)
-                            for s in samples]
+                # One GROUP of images per sample, in the same order the refs are packed as latents,
+                # so a caption saying "image_2" resolves to refs[1] in both the text encoder and the
+                # DiT stream. Passing only ref_paths[0] would make multi-reference composition
+                # instructions ungroundable (the encoder would never see the second subject).
+                vlm_imgs = [[_vlm_resize(Image.open(p), cfg.data.vlm_image_size)
+                             for p in s["ref_paths"]] for s in samples]
             if vlm_imgs is not None and drop_refs and cfg.data.ref_dropout_prob > 0.0:
                 ref_drop = torch.rand(len(samples)) < cfg.data.ref_dropout_prob
                 ctx, mask = encode_text_with_ref_dropout(encoder, caps, vlm_imgs, ref_drop)
@@ -486,6 +584,16 @@ def main():
             mask = mask.to(device)
         refs = ref_grids = None
         if samples[0].get("refs"):                          # edit / multiref / style cache
+            # Caches are bucketed by TARGET grid only, so a batch can mix examples with different
+            # reference COUNTS. The signature below is taken from sample 0, which would then either
+            # raise a bare IndexError or silently apply sample 0's grids to everyone. Fail loudly
+            # instead; batching multi-reference data needs bucketing by ref-count as well.
+            n_ref0 = len(samples[0]["refs"])
+            if any(len(s["refs"]) != n_ref0 for s in samples):
+                counts = sorted({len(s["refs"]) for s in samples})
+                raise RuntimeError(
+                    f"batch mixes different reference counts {counts}: caches are bucketed by target "
+                    f"grid only, so multi-reference data requires batch=1 (or bucketing by ref-count)")
             ref_grids = [(r["grid_h"], r["grid_w"]) for r in samples[0]["refs"]]
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]
@@ -543,22 +651,63 @@ def main():
     # ----- Checkpoint = DiT weights (+TE) + resume state (+EMA weights) + marker -----
     def checkpoint(step_n, *, tag=None):
         tag = tag or f"step{step_n:06d}"
-        wpath = save_ckpt(dit, ckpt_dir, tag, step_n, keep_last=2, prefix="dit")
+        keep = max(1, int(lg.keep_last))
+        wpath = save_ckpt(dit, ckpt_dir, tag, step_n, keep_last=keep, prefix="dit",
+                          extra_meta={"run_digest": run_digest})
         te_path = None
         if train_te and encoder is not None:
-            te_path = save_ckpt(encoder.qwen, ckpt_dir, tag, step_n, keep_last=2, prefix="te")
+            if te_adapters:      # TE-LoRA: store adapters (MBs) instead of the full ~9.6GB encoder
+                te_path = os.path.join(ckpt_dir, f"te_lora_{tag}.safetensors")
+                save_lora(te_adapters, te_path, rank=lc.te_rank or lc.rank,
+                          alpha=lc.alpha or (lc.te_rank or lc.rank),
+                          metadata={"step": step_n}, key_prefix="text_encoder")
+                rotate_by_glob(os.path.join(ckpt_dir, "te_lora_step*.safetensors"), keep)
+            else:
+                te_path = save_ckpt(encoder.qwen, ckpt_dir, tag, step_n, keep_last=keep, prefix="te")
         spath = os.path.join(ckpt_dir, f"trainstate_{tag}.pt")
         save_resume_state(spath, step=step_n, optimizer=opt, scheduler=sched_lr, gen=gen, rng=rng, ema=ema)
-        rotate_by_glob(os.path.join(ckpt_dir, "trainstate_step*.pt"), 2)
+        rotate_by_glob(os.path.join(ckpt_dir, "trainstate_step*.pt"), keep)
         epath = None
         if ema is not None:
             epath = os.path.join(ckpt_dir, f"dit_ema_{tag}.safetensors")
             ema.write_safetensors(epath, dit.state_dict(), metadata={"step": str(step_n), "ema": "1"})
-            rotate_by_glob(os.path.join(ckpt_dir, "dit_ema_step*.safetensors"), 2)
+            rotate_by_glob(os.path.join(ckpt_dir, "dit_ema_step*.safetensors"), keep)
         write_resume_marker(ckpt_dir, step=step_n, weights=wpath, state=spath, ema=epath, te=te_path)
         return wpath
 
-    # ----- Graceful interrupt: save a FULL resumable checkpoint, then exit (survives SSH drop) -----
+    def save_best(tag):
+        """Write a metric-protected checkpoint. Its filenames (``dit_best_step*``) live outside the
+        ``dit_step*`` glob that ``save_ckpt`` rotates, so recency rotation can never delete it.
+        No resume marker is written — a best checkpoint is an artifact, not a resume point.
+
+        Pruning happens only AFTER the new set is written, so free space must cover the incoming
+        artifacts on top of the ones still held. Running out mid-write leaves a truncated 'best'
+        and kills a multi-day run, so refuse up front instead."""
+        need = sum(p.numel() * 2 for p in dit.parameters())          # bf16 serialization
+        if train_te and encoder is not None and not te_adapters:
+            need += sum(p.numel() * 2 for p in encoder.qwen.parameters())
+        if ema is not None:
+            need += sum(p.numel() * 2 for p in dit.parameters())
+        need = int(need * 1.15)                                      # tmp file + slack
+        free = shutil.disk_usage(ckpt_dir).free
+        if free < need:
+            print(f"[eval] SKIP best checkpoint at {tag}: needs ~{need / 1e9:.1f}GB, "
+                  f"only {free / 1e9:.1f}GB free on {ckpt_dir}", flush=True)
+            raise RuntimeError(f"insufficient disk for best checkpoint ({free / 1e9:.1f}GB free, "
+                               f"~{need / 1e9:.1f}GB needed)")
+        save_ckpt(dit, ckpt_dir, tag, 0, keep_last=10 ** 6, prefix="dit_best")
+        if train_te and encoder is not None:
+            if te_adapters:
+                save_lora(te_adapters, os.path.join(ckpt_dir, f"te_best_{tag}.safetensors"),
+                          rank=lc.te_rank or lc.rank, alpha=lc.alpha or (lc.te_rank or lc.rank),
+                          key_prefix="text_encoder")
+            else:
+                save_ckpt(encoder.qwen, ckpt_dir, tag, 0, keep_last=10 ** 6, prefix="te_best")
+        if ema is not None:
+            ema.write_safetensors(os.path.join(ckpt_dir, f"dit_ema_best_{tag}.safetensors"),
+                                  dit.state_dict(), metadata={"ema": "1"})
+
+    # ----- Graceful interrupt: save a FULL resumable checkpoint on signal, then exit -----
     _state = {"step": 0}
 
     def _on_signal(signum, frame):
@@ -592,7 +741,18 @@ def main():
 
         dit.load_state_dict(load_file(marker["_weights_path"]), strict=True)
         if marker.get("_te_path") and encoder is not None:
-            encoder.qwen.load_state_dict(load_file(marker["_te_path"]), strict=False)
+            if te_adapters:      # TE-LoRA resume: restore adapter weights, base is already frozen
+                # Returns the count of adapters with NO saved weights (0 == clean load).
+                missing = load_lora_weights(te_adapters, marker["_te_path"],
+                                            key_prefix="text_encoder")
+                if missing:
+                    raise SystemExit(
+                        f"TE-LoRA resume mismatch: {missing}/{len(te_adapters)} adapters had no "
+                        f"saved weights in {os.path.basename(marker['_te_path'])}. Refusing to "
+                        f"continue with partially random adapters.")
+                print(f"restored {len(te_adapters)} TE-LoRA adapters", flush=True)
+            else:
+                encoder.qwen.load_state_dict(load_file(marker["_te_path"]), strict=False)
         start_step = load_resume_state(marker["_state_path"], optimizer=opt, scheduler=sched_lr,
                                        gen=gen, rng=rng, ema=ema, offload=o.offload_optimizer)
         _state["step"] = start_step
@@ -600,6 +760,71 @@ def main():
 
     steps = 20 if args.smoke else o.steps
     print(f"training {steps} steps (fused={fused}, optim_state={o.optimizer_state}, te_lr={te_lr})", flush=True)
+
+    # ----- Run provenance: what code + config this run ACTUALLY executed -----
+    # A configured setting can silently fail to take effect (e.g. a stale module on the host), with
+    # nothing on disk to prove it afterwards. The manifest hashes the modules really imported.
+    _man = write_manifest(
+        os.path.join(output_dir, "run_manifest.json"), cfg,
+        extra={"cache_dir": cfg.paths.cache_dir, "train_list": cfg.data.train_list,
+               "n_train": n_train, "n_eval": len(eval_paths), "buckets": [list(b) for b in bucket_keys],
+               "steps": steps, "dit_init": f"{cfg.paths.dit_repo}/{cfg.paths.dit_file}",
+               "te_init": cfg.paths.te_init})
+    run_digest = _man["digest"]
+    print(f"run digest {run_digest} -> {os.path.join(output_dir, 'run_manifest.json')} "
+          f"({len(_man['code'])} modules hashed)", flush=True)
+
+    # ----- Quality-eval schedule + metric-driven retention / early stop -----
+    # Log-spaced by default intent: dense early (where the curve moves), sparse late. The scorer is
+    # pluggable so this trainer stays task-agnostic; with none set we fall back to val_loss.
+    eval_step_set = set(parse_eval_steps(lg.eval_steps, steps))
+    scorer = load_scorer(lg.eval_scorer)
+    # Direction must follow the metric, not the config default: the val_loss fallback is
+    # lower-is-better, so leaving mode='max' would select the WORST checkpoint.
+    eval_mode = lg.eval_metric_mode
+    if eval_step_set and scorer is None:
+        if str(eval_mode).lower().startswith("max"):
+            print("[eval] no eval_scorer -> falling back to val_loss; forcing "
+                  "eval_metric_mode='min' (lower loss is better)", flush=True)
+        eval_mode = "min"
+    # Bind the state to this experiment so a reused ckpt_dir can't mix arms/metrics/manifests.
+    # Everything that makes two runs DIFFERENT EXPERIMENTS. Omitting the seed, the data arm, the
+    # system prompt or the conditioning flags would let a reused ckpt_dir silently inherit best /
+    # patience state from a different arm -- the contamination this fingerprint exists to prevent.
+    _fp = "|".join(str(x) for x in (
+        lg.eval_scorer or "val_loss", eval_mode, lg.eval_steps, lg.eval_criteria, lg.eval_guardrails,
+        lg.edit_preview_manifest, o.te_mode, cfg.paths.te_init, cfg.data.resolution,
+        lg.sample_steps, lg.sample_guidance,
+        cfg.runtime.seed, cfg.data.train_list, cfg.data.text_system_prompt,
+        cfg.data.edit_vlm_cond, cfg.data.ref_dropout_prob, cfg.data.masked_loss,
+        f"{cfg.paths.dit_repo}/{cfg.paths.dit_file}"))
+    _criteria = parse_criteria(lg.eval_criteria) or None
+    _guards = parse_guardrails(lg.eval_guardrails)
+    best = BestTracker(ckpt_dir, keep=lg.keep_best, mode=eval_mode,
+                       min_delta=o.early_stop_min_delta, patience=o.early_stop_patience,
+                       fingerprint=_fp, criteria=_criteria, guardrails=_guards)
+    stopped_early = False
+    eval_fail_streak = 0
+    EVAL_FAIL_BUDGET = 3     # consecutive scorer/render failures tolerated before aborting
+    if start_step:
+        _dropped = best.drop_after(start_step)
+        if _dropped:
+            print(f"[eval] resume: discarded {_dropped} eval entr{'y' if _dropped == 1 else 'ies'} "
+                  f"recorded after step {start_step} (they belong to a future this run no longer has)",
+                  flush=True)
+    if eval_step_set:
+        _sched = sorted(eval_step_set)
+        print(f"eval schedule: {len(_sched)} points "
+              f"({', '.join(str(s) for s in _sched[:6])}{', …' if len(_sched) > 6 else ''}) "
+              f"scorer={lg.eval_scorer or 'val_loss'} mode={eval_mode} "
+              f"keep_best={lg.keep_best} patience={o.early_stop_patience}"
+              f" min_delta={o.early_stop_min_delta}", flush=True)
+        if best.stale:
+            print("[eval] NOTE: existing best.json was from a different experiment "
+                  "(fingerprint/mode mismatch) -> starting best/patience state fresh", flush=True)
+        if scorer is None and not val_groups:
+            raise SystemExit("eval_steps is set but nothing can score it: no logging.eval_scorer "
+                             "and no held-out val data. Set eval_scorer or provide val caches.")
     # Step-0 baseline for t2i previews (edit-mode base is handled before the resume load above).
     if lg.sample_every and start_step == 0 and not edit_examples:
         do_preview("step000000_base")
@@ -661,6 +886,25 @@ def main():
                 gsum[_nm] += gstep[_nm] ** 0.5
                 gstep[_nm] = 0.0
             gcnt += 1
+        # A PARTIAL update (some params skipped for non-finite grads while others already stepped)
+        # is invisible in the loss and shows only as a slightly lower grad-norm. Track it: a one-off
+        # is tolerable, a sustained streak means the run is quietly training a different model than
+        # intended, so stop with a resumable checkpoint instead of drifting for days.
+        if gskip["n"]:
+            partial_streak["n"] += 1
+            n_partial_steps += 1
+            if partial_streak["n"] >= PARTIAL_STREAK_ABORT:
+                if o.train_dit:
+                    checkpoint(step + 1, tag=f"partial{step + 1:06d}")
+                raise SystemExit(
+                    f"[grad] {partial_streak['n']} consecutive steps with non-finite gradients on "
+                    f"some parameters ({gskip['n']} skipped on the last one). Each such step updated "
+                    f"only part of the model while the LR schedule advanced. A resumable checkpoint "
+                    f"was written at step {step + 1}.")
+        else:
+            partial_streak["n"] = 0
+        gskip.clear()
+        gskip["n"] = 0
         sched_lr.step()
         run_loss += float(loss.detach())
         if ema is not None:
@@ -670,7 +914,8 @@ def main():
             dt = (time.time() - t0) / lg.log_every
             rec = {"step": step + 1, "loss": run_loss / lg.log_every,
                    "lr": sched_lr.get_last_lr()[0], "s_per_step": round(dt, 3),
-                   "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2), "skipped": n_skipped}
+                   "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2), "skipped": n_skipped,
+                   "partial_steps": n_partial_steps}
             # Per-group grad-norm (mean over the interval). There is ONE joint flow loss (no
             # separate TE loss exists); te_grad_norm is the honest "is the TE learning" signal.
             if gcnt:
@@ -703,11 +948,83 @@ def main():
         if lg.sample_every and (step + 1) % lg.sample_every == 0:
             do_preview(f"step{step + 1:06d}")
 
+        # ----- Quality eval on the (log-spaced) schedule -> best-N retention + early stop -----
+        if (step + 1) in eval_step_set:
+            sheet = os.path.join(output_dir, "samples", f"step{step + 1:06d}.png")
+            score = None
+            # Always re-render: an existing file proves only that the PATH exists, not that it was
+            # produced by these weights (resume replays, reused output_dir, partial reruns).
+            # Isolate eval from training: previews run the encoder too, so leaving it in train()
+            # would make scores stochastic AND advance the global RNG, letting eval cadence perturb
+            # the training trajectory.
+            _enc_was_training = bool(getattr(encoder, "qwen", None) is not None
+                                     and encoder.qwen.training)
+            _rng_cpu = torch.get_rng_state()
+            _rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            try:
+                if _enc_was_training:
+                    encoder.qwen.eval()
+                do_preview(f"step{step + 1:06d}")
+                if scorer is not None:
+                    score = float(scorer(sheet_path=sheet, examples=edit_examples, step=step + 1))
+                elif val_groups:
+                    score = run_val()
+            except Exception as e:
+                print(f"[eval] render/scorer failed: {type(e).__name__} {e}", flush=True)
+                score = None
+            finally:
+                if _enc_was_training:
+                    encoder.qwen.train()
+                torch.set_rng_state(_rng_cpu)
+                if _rng_cuda is not None:
+                    torch.cuda.set_rng_state_all(_rng_cuda)
+
+            res = best.update(step + 1, score, save_fn=(save_best if o.train_dit else None)) \
+                if score is not None else {"invalid": True}
+            if res.get("invalid"):
+                # A non-finite or failed score is NOT a data point: never let it define "best" or
+                # advance patience. Tolerate a few, then stop cleanly rather than run for days with
+                # checkpoint selection silently dead.
+                eval_fail_streak += 1
+                print(f"[eval] step {step + 1}: unusable score "
+                      f"({eval_fail_streak}/{EVAL_FAIL_BUDGET})", flush=True)
+                if eval_fail_streak >= EVAL_FAIL_BUDGET:
+                    if o.train_dit:
+                        checkpoint(step + 1, tag=f"evalfail{step + 1:06d}")
+                    raise SystemExit(
+                        f"[eval] {eval_fail_streak} consecutive unusable eval scores -> aborting so "
+                        f"checkpoint selection/early-stop are not silently dead. A resumable "
+                        f"checkpoint was written at step {step + 1}.")
+            else:
+                eval_fail_streak = 0
+                erec = {"step": step + 1, "eval_score": round(score, 6)}
+                erec.update(best_value=round(res["best_value"], 6),
+                            since_improved=res["since_improved"])
+                if res["saved_best"]:
+                    erec["saved_best"] = True
+                with open(metrics_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(erec) + "\n")
+                tracker.log({"eval_score": score}, step + 1)
+                print(erec, flush=True)
+                if res["should_stop"]:
+                    _s = best.summary()
+                    print(f"EARLY STOP at step {step + 1}: no improvement > "
+                          f"{o.early_stop_min_delta} for {res['since_improved']} evals "
+                          f"(best {_s['best_value']} @ step {_s['best_step']}; kept {_s['kept']})",
+                          flush=True)
+                    if o.train_dit:
+                        checkpoint(step + 1, tag="final")
+                    stopped_early = True
+                    break
+            t0 = time.time()   # don't bill eval wall-time to the next step's s/step
+
     if args.smoke:
         do_preview("smoke")
         print("SMOKE OK", flush=True)
-    elif o.train_dit:
+    elif o.train_dit and not stopped_early:
         checkpoint(steps, tag="final")
+    if eval_step_set:
+        print(f"[eval] best: {best.summary()}", flush=True)
     tracker.close()
 
 

@@ -117,28 +117,51 @@ class Qwen3VLConditioner(torch.nn.Module):
     def _forward_mm(self, text, images) -> tuple[Tensor, Tensor]:
         """Condition on reference image(s) via the Qwen3-VL vision tower.
 
-        Each prompt + its reference image go through the multimodal processor (image-pad tokens are
+        Each prompt + its reference image(s) go through the multimodal processor (image-pad tokens are
         expanded by the vision grid); we tap the same 12 layers and keep the image + user-text tokens,
         dropping only the system prefix -> conditioning lands in the same ``(B, L, 12, 2560)`` space the
-        DiT consumes. ``images`` is one PIL image per prompt (or a single shared image). The DiT must be
-        (LoRA-)trained to use these image-conditioning tokens, which the text-only base does not produce.
-        Assumes one image per prompt (batch=1 is the typical style/edit case).
+        DiT consumes. The DiT must be (LoRA-)trained to use these image-conditioning tokens, which the
+        text-only base does not produce.
+
+        ``images`` accepts three shapes:
+
+        * a single PIL image                -> shared by every prompt
+        * ``[img, img, ...]``               -> ONE image per prompt (single-reference editing)
+        * ``[[img, img], [img], ...]``      -> N images per prompt (multi-reference composition)
+
+        The nested form is what makes instructions like "put the woman from image_2 onto the
+        background of image_1" groundable: with only the first reference visible the encoder cannot
+        resolve which object the text is referring to. Placeholders are emitted in reference order,
+        so image_1/image_2 in the caption line up with refs[0]/refs[1].
         """
         from transformers import AutoProcessor
 
         if self._mm_processor is None:
             self._mm_processor = AutoProcessor.from_pretrained(self._version)
             self._patch_vision_patch_embed()
+        # Normalise every input shape to one LIST of images per prompt.
         if not isinstance(images, (list, tuple)):
-            images = [images] * len(text)
+            per_prompt = [[images] for _ in text]
+        elif images and isinstance(images[0], (list, tuple)):
+            per_prompt = [list(g) for g in images]
+        else:
+            per_prompt = [[im] for im in images]
+        if len(per_prompt) == 1 and len(text) > 1:      # single shared group -> broadcast
+            per_prompt = [list(per_prompt[0]) for _ in text]
+        if len(per_prompt) != len(text):
+            raise ValueError(f"images groups ({len(per_prompt)}) != prompts ({len(text)})")
         chats = [
             self._mm_processor.apply_chat_template(
                 [{"role": "system", "content": self.system_prompt},
-                 {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": t}]}],
+                 {"role": "user", "content": [*({"type": "image"} for _ in imgs),
+                                              {"type": "text", "text": t}]}],
                 tokenize=False, add_generation_prompt=True)
-            for t in text
+            for t, imgs in zip(text, per_prompt)
         ]
-        inputs = self._mm_processor(text=chats, images=list(images), return_tensors="pt",
+        # Flat, in prompt-then-reference order: the processor consumes images positionally against
+        # the image placeholders it finds across the batch.
+        flat = [im for group in per_prompt for im in group]
+        inputs = self._mm_processor(text=chats, images=flat, return_tensors="pt",
                                     padding=True).to(self.qwen.device)
         trainable = any(p.requires_grad for p in self.qwen.parameters())
         with contextlib.nullcontext() if trainable else torch.no_grad():

@@ -30,6 +30,7 @@ import json
 import math
 import os
 import re
+import threading
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote, urlparse, parse_qs
@@ -37,6 +38,11 @@ from urllib.parse import quote, unquote, urlparse, parse_qs
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 _SHEET_COLS = 4  # T2I preview contact sheets are built 4-wide (train_t2i_full_cached._sample)
 _IMG_CACHE = {}  # {path: (mtime, PIL.Image)} -- decode a contact sheet once per version, not per poll
+# Composed edit "cards" (one whole image per example: prompt header + 2x2 labelled tiles on black).
+# Built once per (sheet, mtime) for all examples so a gallery load decodes the big sheet a single time.
+_CARD_CACHE = {}  # {"_key": (path, mtime), k: png_bytes}
+_CARD_LOCK = threading.Lock()
+_FONT_CACHE = {}  # {size: PIL.ImageFont}
 
 _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -76,6 +82,12 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
  .card h3{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--mut);
    text-transform:uppercase;letter-spacing:.6px}
  canvas{max-height:230px}
+ .ebars{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:5px 18px;margin:2px 2px 6px}
+ .ebar{display:flex;align-items:center;gap:8px;font-size:11.5px}
+ .ebar .nm{flex:0 0 46%;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .ebar .tr{flex:1;height:9px;background:#141922;border-radius:5px;overflow:hidden}
+ .ebar .fl{height:100%;border-radius:5px}
+ .ebar .pc{flex:0 0 34px;text-align:right;color:var(--ink);font-variant-numeric:tabular-nums}
  .sech{display:flex;align-items:center;gap:12px;margin:30px 2px 14px;flex-wrap:wrap}
  .sech h2{font-size:15px;margin:0;font-weight:650}
  .sech .muted{color:var(--mut);font-size:12px}
@@ -86,7 +98,7 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
  .pager button:disabled{opacity:.35;cursor:default}
  .pager .lbl{font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums;min-width:150px;text-align:center}
  .hint{font-size:11px;color:var(--mut);margin:0 2px 12px}
- .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(248px,1fr));gap:16px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px}
  figure.scard{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:14px;
    overflow:hidden;transition:transform .15s ease,border-color .15s ease}
  figure.scard:hover{transform:translateY(-3px);border-color:#33405a}
@@ -103,14 +115,29 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
  figcaption{padding:9px 11px 11px;font-size:12px;line-height:1.45;color:var(--mut);
    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:38px}
  .empty{color:var(--mut);font-size:13px;padding:30px 0}
+ /* edit runs: 4 tiles as a 2x2 grid per card (source | ground truth / base | trained) */
+ figure.scard.wide{grid-column:1/-1}
+ .tiles4{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:#05070b}
+ .tile{position:relative;aspect-ratio:1/1;overflow:hidden;cursor:zoom-in}
+ .tile img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .35s ease}
+ .tile:hover img{transform:scale(1.06)}
+ .tlabel{position:absolute;top:5px;left:5px;background:rgba(8,10,14,.82);border:1px solid var(--line);
+   font-size:10px;font-weight:650;padding:1px 6px;border-radius:999px;letter-spacing:.2px}
+ .tile.missing{display:flex;align-items:center;justify-content:center;color:var(--mut);font-size:11px}
+ /* composed edit card: one whole image (prompt + 2x2 tiles + labels, baked on black) */
+ .cimg{cursor:zoom-in;background:#05070b;line-height:0}
+ .cimg img{width:100%;display:block;transition:transform .2s ease}
+ figure.scard:hover .cimg img{transform:scale(1.015)}
  /* lightbox: preview + base side by side */
  #lb{position:fixed;inset:0;z-index:50;background:rgba(5,7,11,.93);display:none;
    align-items:center;justify-content:center;flex-direction:column;gap:14px;padding:24px;cursor:zoom-out}
  #lb.on{display:flex}
- #lbrow{display:flex;gap:18px;align-items:flex-start;max-width:96vw}
- .lbfig{margin:0;display:flex;flex-direction:column;gap:8px;align-items:center}
- .lbfig img{max-width:46vw;max-height:74vh;border-radius:12px;border:1px solid var(--line);
+ #lbrow{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start;max-width:88vw}
+ .lbfig{margin:0;display:flex;flex-direction:column;gap:6px;align-items:center;min-width:0}
+ .lbfig img{max-width:42vw;max-height:38vh;width:100%;border-radius:12px;border:1px solid var(--line);
    object-fit:contain;background:#05070b;cursor:default}
+ .lbfig.solo{grid-column:1/-1}
+ .lbfig.solo img{max-width:94vw;max-height:90vh;width:auto}
  .lbfig figcaption .tg{font-weight:700;letter-spacing:.5px;font-size:12px}
  #lbcap{color:var(--ink);font-size:13px;max-width:90vw;text-align:center;line-height:1.5}
  #lbhint{color:var(--mut);font-size:12px}
@@ -131,6 +158,11 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="card"><h3>peak VRAM (GB)</h3><canvas id="vram"></canvas></div>
   <div class="card"><h3>sec / step</h3><canvas id="speed"></canvas></div>
  </div>
+ <div class="sech" id="evalhdr" style="display:none"><h2>Held-out edit eval</h2><span class="muted" id="ecount"></span></div>
+ <div class="charts" id="evalwrap" style="display:none">
+  <div class="card" style="grid-column:1/-1"><h3>edit-success rate vs step — <b>overall</b> + family groups (judged on the held-out set)</h3><canvas id="evalc"></canvas></div>
+ </div>
+ <div class="ebars" id="ebars"></div>
  <div class="sech"><h2>Samples</h2><span class="muted" id="scount"></span>
   <div class="pager">
    <button id="first" title="first">⏮</button>
@@ -140,16 +172,13 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
    <button id="last" title="latest">⏭</button>
   </div>
  </div>
- <div class="hint">Click an image to <b>zoom</b> (preview + base side by side) · double-click to toggle <b>BASE</b> inline · ◀ ▶ (or arrow keys) page through preview steps. <b>Edit runs:</b> each card is one example — within the strip, left = <b>source</b>, center = <b>model output</b>, right = <b>target</b> (ground truth).</div>
+ <div class="hint">Click a tile to <b>zoom</b> the full set · ◀ ▶ (or arrow keys) page through preview steps. <b>Edit runs:</b> each card is one example — <b>1 source</b> · <b>2 ground truth</b> · <b>3 base</b> (untrained model) · <b>4 trained</b> (current step).</div>
  <div class="grid" id="gallery"><div class="empty">no previews yet</div></div>
 </div>
 <div id="lb">
- <div id="lbrow">
-  <figure class="lbfig"><img id="lbprev" src=""><figcaption><span class="tg" style="color:#6ea8fe">PREVIEW</span></figcaption></figure>
-  <figure class="lbfig" id="lbbasewrap"><img id="lbbase" src=""><figcaption><span class="tg" style="color:#e3b341">BASE</span></figcaption></figure>
- </div>
+ <div id="lbrow"></div>
  <div id="lbcap"></div>
- <div id="lbhint">Esc or click the backdrop to close · double-click a card to toggle base inline</div>
+ <div id="lbhint">Esc or click the backdrop to close</div>
 </div>
 <script>
 const TOTAL=__TOTAL__;
@@ -173,9 +202,14 @@ const gnorm=new Chart(document.getElementById('gnorm'),gridCfg({legend:true}));
 gnorm.data.datasets=[ds('DiT','#6ea8fe'),ds('TE','#d2a8ff')];
 const vram=new Chart(document.getElementById('vram'),gridCfg());vram.data.datasets=[ds('vram','#f2756b',true)];
 const speed=new Chart(document.getElementById('speed'),gridCfg());speed.data.datasets=[ds('s/step','#56d364')];
+const evalCfg=gridCfg({legend:true});evalCfg.options.scales.y.min=0;evalCfg.options.scales.y.max=1;
+evalCfg.options.scales.y.ticks.callback=v=>Math.round(v*100)+'%';
+const evalc=new Chart(document.getElementById('evalc'),evalCfg);
+const EG=[['overall','#ffffff',3],['global/style','#56d364',2],['structural','#6ea8fe',2],['person','#d2a8ff',2],['text','#f2756b',2]];
+evalc.data.datasets=EG.map(([l,c,w])=>({label:l,data:[],borderColor:c,backgroundColor:c,pointRadius:2,borderWidth:w,tension:.2,spanGaps:true}));
 const chip=(k,v,cls='')=>`<span class="chip ${cls}"><span class="k">${k}</span><b>${v}</b></span>`;
 
-let STEPS=[], curStep=null, pinned=false, data={items:[]}, lastKey='';
+let STEPS=[], curStep=null, pinned=false, data={items:[]}, lastKey='', CARDS=[];
 const G=id=>document.getElementById(id);
 
 function renderGallery(){
@@ -186,11 +220,13 @@ function renderGallery(){
  G('first').disabled=G('prev').disabled=(i<=0);
  G('last').disabled=G('next').disabled=(i<0||i>=STEPS.length-1);
  // Re-render the gallery DOM ONLY when content changes -> images never re-fetch on
- // unchanged polls (no flicker) and an inline base-toggle survives the next poll.
- const key=(data.step)+'·'+items.map(it=>it.src+'|'+(it.base||'')).join('~');
+ // unchanged polls (no flicker).
+ const key=(data.step)+'·'+items.map(it=>(it.card||it.src)+'|'+(it.base||'')).join('~');
  if(key===lastKey) return;
  lastKey=key;
- G('gallery').innerHTML=items.length? items.map(it=>{
+ CARDS=items;
+ G('gallery').innerHTML=items.length? items.map((it,ci)=>{
+   if(it.card) return cardEdit(it,ci);
    const hasBase=!!it.base;
    return `<figure class="scard" data-prev="${esc(it.src)}" data-base="${esc(it.base||'')}" data-prompt="${esc(it.prompt||'')}" data-idx="${it.idx}">`
     +`<div class="imgwrap" onclick="imgClick(this)" ondblclick="imgDbl(this)">`
@@ -199,6 +235,13 @@ function renderGallery(){
     +`<figcaption>${it.prompt?esc(it.prompt):'<span style=opacity:.5>no prompt</span>'}`
     +`${hasBase?'':' <span style="color:#f2756b">· no base yet</span>'}</figcaption></figure>`;
   }).join('') : '<div class="empty">no previews yet</div>';
+}
+const TLC=['#9aa0a8','#78c878','#e3b341','#6ea8fe'];  // source / GT / base / trained
+function cardEdit(it,ci){
+ // One whole composed image per example (prompt + 2x2 labelled tiles, baked server-side) so the
+ // entire set can be grabbed / saved / shared as a single picture. Click zooms it full-size.
+ return `<figure class="scard"><div class="cimg" onclick="zoomImg(this)" title="click to enlarge (right-click the big image to save)">`
+   +`<img loading="lazy" src="${esc(it.card)}"></div></figure>`;
 }
 let clickT=null;  // single click = zoom; double click = toggle base (delay disambiguates)
 function imgClick(w){if(clickT)return;clickT=setTimeout(()=>{clickT=null;zoom(w.closest('.scard'));},220);}
@@ -210,14 +253,19 @@ function tog(wrap){
  else{img.src=base;img.dataset.mode='base';b.textContent=`#${f.dataset.idx} · BASE`;b.classList.add('base');}
 }
 function zoom(f){
- G('lbprev').src=f.dataset.prev;
- if(f.dataset.base){G('lbbase').src=f.dataset.base;G('lbbasewrap').style.display='';}
- else{G('lbbase').removeAttribute('src');G('lbbasewrap').style.display='none';}
+ G('lbrow').innerHTML=`<figure class="lbfig"><img class="lbimg" src="${esc(f.dataset.prev)}"><figcaption><span class="tg" style="color:#6ea8fe">PREVIEW</span></figcaption></figure>`
+  +(f.dataset.base?`<figure class="lbfig"><img class="lbimg" src="${esc(f.dataset.base)}"><figcaption><span class="tg" style="color:#e3b341">BASE</span></figcaption></figure>`:'');
  G('lbcap').innerHTML=`#${f.dataset.idx} · step ${(data.step||0).toLocaleString()} — ${esc(f.dataset.prompt||'')}`
    +(f.dataset.base?'':' <span style="color:#f2756b">(no base sample)</span>');
  G('lb').classList.add('on');
 }
-G('lb').onclick=e=>{if(e.target.id!=='lbprev'&&e.target.id!=='lbbase')G('lb').classList.remove('on');};
+function zoomImg(el){
+ const src=el.querySelector('img').src;
+ G('lbrow').innerHTML=`<figure class="lbfig solo"><img class="lbimg" src="${esc(src)}"></figure>`;
+ G('lbcap').innerHTML='';
+ G('lb').classList.add('on');
+}
+G('lb').onclick=e=>{if(!e.target.classList.contains('lbimg'))G('lb').classList.remove('on');};
 document.addEventListener('keydown',e=>{
  if(e.key==='Escape')G('lb').classList.remove('on');
  else if(!G('lb').classList.contains('on')){if(e.key==='ArrowLeft')go(-1);if(e.key==='ArrowRight')go(1);}});
@@ -261,7 +309,24 @@ async function pollMetrics(){
   else G('prog').textContent=`step ${step.toLocaleString()} · pass --total for a progress bar`;
  }catch(e){G('sub').textContent='metrics unavailable';}
 }
-async function tick(){await pollMetrics(); if(!pinned) await loadSamples();}
+const evcol=v=>{const h=Math.round(120*Math.max(0,Math.min(1,v)));return `hsl(${h},58%,46%)`;};
+async function pollEval(){
+ let ev;try{ev=await (await fetch('api/eval')).json();}catch(e){return;}
+ if(!ev||!ev.length){return;}
+ G('evalhdr').style.display='';G('evalwrap').style.display='';
+ EG.forEach((g,i)=>{const key=g[0];
+  evalc.data.datasets[i].data=ev.map(r=>({x:r.step,y:key==='overall'?r.overall:(r.groups?r.groups[key]:null)}))
+   .filter(p=>p.y!=null);});
+ evalc.update();
+ const last=ev[ev.length-1],pf=last.per_family||{};
+ const fams=Object.keys(pf).sort((a,b)=>pf[a]-pf[b]);  // worst first = what needs attention
+ G('ecount').textContent=`step ${(last.step||0).toLocaleString()} · overall ${Math.round(last.overall*100)}%`
+  +(last.overall_partial!=null?` (incl. partial ${Math.round(last.overall_partial*100)}%)`:'')+` · K=${last.n_per_family}/family`;
+ G('ebars').innerHTML=fams.map(f=>{const v=pf[f];return `<div class="ebar" title="${esc(f)} — ${Math.round(v*100)}%">`
+  +`<span class="nm">${esc(f)}</span><span class="tr"><span class="fl" style="width:${Math.round(v*100)}%;background:${evcol(v)}"></span></span>`
+  +`<span class="pc">${Math.round(v*100)}%</span></div>`;}).join('');
+}
+async function tick(){await pollMetrics(); await pollEval(); if(!pinned) await loadSamples();}
 tick();setInterval(tick,2500);
 </script></body></html>"""
 
@@ -297,10 +362,18 @@ class Handler(BaseHTTPRequestHandler):
     elif path == "/api/samples":
       step = int(qs["step"][0]) if "step" in qs else None
       self._send(200, json.dumps(self._samples(step)))
+    elif path == "/api/eval":
+      self._send(200, json.dumps(self._eval()))
     elif path.startswith("/samples/"):
       self._serve_image(path[len("/samples/"):])
     elif path.startswith("/tile/"):
       self._serve_tile(path[len("/tile/"):])
+    elif path.startswith("/cell/"):
+      self._serve_cell(path[len("/cell/"):])
+    elif path.startswith("/basecell/"):
+      self._serve_basecell(path[len("/basecell/"):])
+    elif path.startswith("/card/"):
+      self._serve_card(path[len("/card/"):])
     elif path.startswith("/baseimg/"):
       self._serve_base(path[len("/baseimg/"):])
     else:
@@ -318,6 +391,43 @@ class Handler(BaseHTTPRequestHandler):
           except json.JSONDecodeError:
             pass
     return rows
+
+  @staticmethod
+  def _fam_group(name):
+    """Bucket an edit-family name into one of 4 super-groups for the eval chart lines."""
+    s = (name or "").lower()
+    if "text" in s or "font" in s or "translate" in s:
+      return "text"
+    person_kw = ("person", "expression", "accessor", "pose", "age /", "clothing", "caricature",
+                 "funko", "lego", "simpson", "pixar", "anime", "sticker", "line-art", "western comic")
+    if any(k in s for k in person_kw):
+      return "person"
+    struct_kw = ("remove", "replace one object", "object category", "add a new object",
+                 "add new scene", "size/shape", "outpaint", "relocate", "zoom", "attribute")
+    if any(k in s for k in struct_kw):
+      return "structural"
+    return "global/style"
+
+  def _eval(self):
+    """Parse eval_scores.jsonl and attach per-record super-group means for the dashboard chart."""
+    p = os.path.join(self.run, "eval_scores.jsonl")
+    out = []
+    if os.path.exists(p):
+      for line in open(p, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+          continue
+        try:
+          r = json.loads(line)
+        except json.JSONDecodeError:
+          continue
+        groups = {"global/style": [], "structural": [], "person": [], "text": []}
+        for fam, v in (r.get("per_family") or {}).items():
+          groups[self._fam_group(fam)].append(v)
+        r["groups"] = {g: (round(sum(vs) / len(vs), 4) if vs else None) for g, vs in groups.items()}
+        out.append(r)
+    out.sort(key=lambda r: r.get("step", 0))
+    return out
 
   def _samples_root(self):
     return self.samples_dir or os.path.join(self.run, "samples")
@@ -380,9 +490,17 @@ class Handler(BaseHTTPRequestHandler):
         items.append({"src": f"samples/{quote(sheet)}", "base": self._base_src(0),
                       "prompt": prompts.get("0", ""), "idx": 0})
       else:
+        edit = self._layout().get("mode") == "edit"
+        sq = quote(sheet)
         for k in range(n):
-          items.append({"src": f"tile/{quote(sheet)}/{k}", "base": self._base_src(k),
-                        "prompt": prompts.get(str(k), ""), "idx": k})
+          item = {"src": f"tile/{sq}/{k}", "base": self._base_src(k),
+                  "prompt": prompts.get(str(k), ""), "idx": k}
+          if edit:
+            # One whole composed image per example (prompt on top + 2x2 labelled tiles on black:
+            # source, ground truth, base-model output, trained output) -- grabbable as a single
+            # picture. Server-composed at /card so the big step sheet is decoded once for all 26.
+            item["card"] = f"card/{sq}/{k}"
+          items.append(item)
     return {"step": target, "steps": steps, "items": items}
 
   def _safe(self, root, name):
@@ -451,6 +569,173 @@ class Handler(BaseHTTPRequestHandler):
       buf = BytesIO()
       img.crop(box).save(buf, "PNG")
       self._send(200, buf.getvalue(), "image/png")
+    except Exception:
+      self._send(404, "{}")
+
+  def _crop_cell(self, img, k, n, c, cols=3):
+    """Crop cell (row k, column c of ``cols``) from an edit contact sheet / base row."""
+    W, H = img.size
+    th = H // n
+    cw = W // cols
+    box = (c * cw, k * th, c * cw + cw, k * th + th)
+    buf = BytesIO()
+    img.crop(box).save(buf, "PNG")
+    return buf.getvalue()
+
+  def _serve_cell(self, rest):
+    """/cell/<sheet>/<k>/<c> -> one cell (row k, column c of 3) of an EDIT sheet:
+    column 0 = source, 1 = trained model output, 2 = target (ground truth)."""
+    try:
+      name, k, c = rest.rsplit("/", 2)
+      k, c = int(k), int(c)
+    except ValueError:
+      return self._send(404, "{}")
+    p = self._safe(self._samples_root(), name)
+    if not p or c not in (0, 1, 2):
+      return self._send(404, "{}")
+    try:
+      n = max(1, len(self._prompts()))
+      self._send(200, self._crop_cell(self._sheet(p), k, n, c), "image/png")
+    except Exception:
+      self._send(404, "{}")
+
+  def _serve_basecell(self, rest):
+    """/basecell/<k>/<c> -> one cell of base_previews/idx{k}.png (a single
+    [source | base-output | target] row): column 1 is the untrained-model output."""
+    try:
+      k, c = rest.rsplit("/", 1)
+      k, c = int(k), int(c)
+    except ValueError:
+      return self._send(404, "{}")
+    p = os.path.join(self._base_root(), f"idx{k}.png")
+    if not os.path.isfile(p) or c not in (0, 1, 2):
+      return self._send(404, "{}")
+    try:
+      self._send(200, self._crop_cell(self._sheet(p), 0, 1, c), "image/png")
+    except Exception:
+      self._send(404, "{}")
+
+  @staticmethod
+  def _card_font(size):
+    f = _FONT_CACHE.get(size)
+    if f is None:
+      from PIL import ImageFont
+      for cand in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                   "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                   "DejaVuSans.ttf"):
+        try:
+          f = ImageFont.truetype(cand, size)
+          break
+        except Exception:
+          continue
+      if f is None:
+        f = ImageFont.load_default()
+      _FONT_CACHE[size] = f
+    return f
+
+  def _compose_card(self, sheet, base, k, n, prompt, step):
+    """One example -> a single image: wrapped prompt on top, then a 2x2 of labelled tiles
+    (source, ground truth, base-model output, trained output) on black. Returns a PIL image."""
+    from PIL import Image, ImageDraw
+    T, PAD, GAP, LBL_H = 512, 20, 8, 30
+    W, H = sheet.size
+    th, cw = H // n, W // 3
+    def cell(img, c, cols):
+      w = img.size[0] // cols
+      row = k if cols == 3 else 0
+      rh = img.size[1] // (n if cols == 3 else 1)
+      return img.crop((c * w, row * rh, c * w + w, row * rh + rh)).resize((T, T))
+    src = cell(sheet, 0, 3)
+    trained = cell(sheet, 1, 3)
+    tgt = cell(sheet, 2, 3)
+    # base_previews/idx{k}.png is a SINGLE-row [source|base|target] image, not the
+    # tall 26-row sheet -- crop its middle third at full height (not via cell(),
+    # which would slice a 1/n-tall sliver and stretch it into noise).
+    def bcell(img, c):
+      w = img.size[0] // 3
+      return img.crop((c * w, 0, c * w + w, img.size[1])).resize((T, T))
+    base_out = bcell(base, 1) if base is not None else None
+    tiles = [
+      (src, "1 · SOURCE", (154, 160, 168)),
+      (tgt, "2 · GROUND TRUTH", (120, 200, 120)),
+      (base_out, "3 · BASE (untrained)", (227, 179, 65)),
+      (trained, f"4 · TRAINED (step {step:,})".replace(",", " "), (110, 168, 254)),
+    ]
+    f_lbl, f_pr = self._card_font(19), self._card_font(19)
+    colW = PAD * 2 + T * 2 + GAP
+    tmp = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+    def wrap(txt, fnt, maxw):
+      out, cur = [], ""
+      for wd in txt.split():
+        t = (cur + " " + wd).strip()
+        if tmp.textlength(t, font=fnt) <= maxw:
+          cur = t
+        else:
+          out.append(cur)
+          cur = wd
+      if cur:
+        out.append(cur)
+      return out
+    plines = wrap(f"#{k} · {prompt}", f_pr, colW - PAD * 2)[:3]
+    PR_H = 6 + len(plines) * 24 + 10
+    rowH = LBL_H + T
+    canvas = Image.new("RGB", (colW, PAD + PR_H + rowH * 2 + GAP + PAD), (16, 17, 20))
+    d = ImageDraw.Draw(canvas)
+    for i, ln in enumerate(plines):
+      d.text((PAD, PAD + i * 24), ln, font=f_pr, fill=(210, 212, 218))
+    y0 = PAD + PR_H
+    for i, (tile, lab, col) in enumerate(tiles):
+      x = PAD + (i % 2) * (T + GAP)
+      y = y0 + (i // 2) * (rowH + GAP)
+      d.text((x + 2, y), lab, font=f_lbl, fill=col)
+      if tile is not None:
+        canvas.paste(tile, (x, y + LBL_H))
+      else:
+        d.rectangle([x, y + LBL_H, x + T, y + LBL_H + T], fill=(20, 22, 26))
+        d.text((x + T // 2 - 12, y + LBL_H + T // 2 - 8), "n/a", font=f_lbl, fill=(138, 148, 166))
+      d.rectangle([x, y + LBL_H, x + T, y + LBL_H + T], outline=(60, 62, 68), width=1)
+    return canvas
+
+  def _ensure_cards(self, name, p):
+    """Build + cache the composed card PNGs for every example of sheet ``p`` (one decode of the
+    big step sheet for the whole gallery). No-op if already built for this (path, mtime)."""
+    from PIL import Image
+    key = (p, os.path.getmtime(p))
+    with _CARD_LOCK:
+      if _CARD_CACHE.get("_key") == key:
+        return
+      prompts = self._prompts()
+      n = max(1, len(prompts))
+      step = self._stepof(name)
+      broot = self._base_root()
+      sheet = Image.open(p).convert("RGB")
+      cards = {"_key": key}
+      for k in range(n):
+        bp = os.path.join(broot, f"idx{k}.png")
+        base = Image.open(bp).convert("RGB") if os.path.isfile(bp) else None
+        buf = BytesIO()
+        self._compose_card(sheet, base, k, n, prompts.get(str(k), ""), step).save(buf, "PNG")
+        cards[k] = buf.getvalue()
+        if base is not None:
+          base.close()
+      sheet.close()
+      _CARD_CACHE.clear()
+      _CARD_CACHE.update(cards)
+
+  def _serve_card(self, rest):
+    """/card/<sheet>/<k> -> one composed image (prompt + 2x2 labelled tiles) for example k."""
+    try:
+      name, k = rest.rsplit("/", 1)
+      k = int(k)
+    except ValueError:
+      return self._send(404, "{}")
+    p = self._safe(self._samples_root(), name)
+    if not p:
+      return self._send(404, "{}")
+    try:
+      self._ensure_cards(name, p)
+      data = _CARD_CACHE.get(k)
+      self._send(200, data, "image/png") if data else self._send(404, "{}")
     except Exception:
       self._send(404, "{}")
 

@@ -34,6 +34,45 @@ from precache_t2i import ALIGN, atomic_save, encode_latent, images_to_tensor, pa
 from training_config import apply_runtime, dtype_of, load_config
 
 
+def _stat_id(path: str) -> str:
+    """size+mtime as a content proxy. A full content hash over the whole dataset costs more than the
+    encode it protects; size+mtime catches an edited or replaced file, which is the real risk."""
+    try:
+        st = os.stat(path)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return "missing"
+
+
+def _payload_sig(tgt: str, refs: list, caption: str, res: int, cache_text: bool,
+                 *, system_prompt: str = "", encoder_id: str = "", vae_id: str = "") -> str:
+    """Fingerprint of everything a cached payload depends on.
+
+    Reference ORDER is significant (each reference occupies its own RoPE frame, so swapping two
+    references is a different training example), which is why this hashes the ordered list rather
+    than a set.
+
+    Includes the PRODUCERS of the payload, not just its inputs: the text encoder identity and system
+    prompt (they determine cached text), the VAE identity (it determines every latent), and file
+    size+mtime (an image can be replaced in place). Hashing only path strings would miss exactly the
+    failure this repo already hit -- a system prompt that changed while every path stayed identical.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(os.path.abspath(tgt).encode("utf-8"))
+    h.update(_stat_id(tgt).encode("utf-8"))
+    for r in refs:                       # ordered on purpose
+        h.update(b"\x00")
+        h.update(os.path.abspath(r).encode("utf-8"))
+        h.update(_stat_id(r).encode("utf-8"))
+    h.update(b"\x01")
+    h.update((caption or "").encode("utf-8"))
+    h.update(f"|res={int(res)}|text={bool(cache_text)}".encode("utf-8"))
+    h.update(f"|sys={system_prompt}|enc={encoder_id}|vae={vae_id}".encode("utf-8"))
+    return h.hexdigest()[:32]
+
+
 def _caption(line: dict) -> str:
     for k in ("caption", "instruction", "text"):
         if line.get(k):
@@ -106,16 +145,28 @@ def main() -> None:
             skipped += 1
             continue
         tgt = resolve(line["target"])
+        caption = _caption(line)
+        # The payload depends on the target, the ORDERED references, the caption and the
+        # resolution -- validating only the target path lets a changed reference order, an added
+        # reference, an edited instruction or a different resolution silently reuse a stale cache.
+        sig = _payload_sig(tgt, refs, caption, res, args.cache_text,
+                           system_prompt=getattr(cfg.data, "text_system_prompt", ""),
+                           encoder_id=cfg.paths.text_encoder_id, vae_id=cfg.paths.vae_id)
         out = os.path.join(cache_dir, f"{idx:06d}.pt")
         if os.path.exists(out):  # content-aware skip
             try:
-                if torch.load(out, map_location="cpu", weights_only=False).get("src") == os.path.abspath(tgt):
+                prev = torch.load(out, map_location="cpu", weights_only=False)
+                if prev.get("sig") == sig:
                     skipped += 1
                     continue
+                # A signature-less cache cannot be shown to match the current caption, cache_text,
+                # system prompt, encoder or VAE, so it is recached rather than trusted.
+                why = "no signature" if prev.get("sig") is None \
+                    else "signature mismatch"
+                print(f"  RECACHE idx={idx}: {why}", flush=True)
             except Exception:
                 pass
 
-        caption = _caption(line)
         try:
             z_tgt, gh, gw = _encode_image(vae, tgt, res, device, dtype)
             ref_payload = []
@@ -129,7 +180,8 @@ def main() -> None:
 
         payload = {"z_tgt": z_tgt, "grid_h": gh, "grid_w": gw, "idx": idx,
                    "caption": caption, "src": os.path.abspath(tgt), "refs": ref_payload,
-                   "ref_paths": [os.path.abspath(r) for r in refs]}  # source pixels for optional VLM cond
+                   "ref_paths": [os.path.abspath(r) for r in refs],  # source pixels for optional VLM cond
+                   "sig": sig}  # fingerprint of everything the payload depends on (see the skip check)
         if args.cache_text:
             hiddens, mask = encoder([caption])
             payload["llm_text"] = hiddens[0][mask[0]].to(torch.bfloat16).cpu()

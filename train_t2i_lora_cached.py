@@ -21,7 +21,7 @@ import torch
 from loading import build_dit, build_encoder, build_vae
 from lora import inject_lora, inject_lora_te, load_lora_weights, lora_parameters, save_lora
 from scheduler import get_schedule_for_seqlen
-from train_t2i import edit_training_step, encode_text_with_ref_dropout, t2i_training_step
+from train_t2i import edit_training_step, encode_text_with_ref_dropout, t2i_training_step, permute_reference_order
 from train_t2i_full_joint_cached import (
     DEFAULT_PREVIEWS,
     home_volume_guard,
@@ -83,15 +83,15 @@ def main():
     dit = build_dit(cfg, device, dtype, load_weights=True, train=False)
     fp8_base = o.quantize_base == "fp8" and lc.train_transformer
     if fp8_base:
-        from quantize import quantize_dit_fp8   # frozen-base e4m3 -> ~half base VRAM (helps fit 16GB @1024)
+        from quantize import quantize_dit_fp8   # quantise the frozen base to e4m3 to lower its memory
         nq = quantize_dit_fp8(dit)
-        print(f"fp8-quantized {nq} frozen base Linears (attn+mlp) -> ~half base VRAM", flush=True)
+        print(f"fp8-quantized {nq} frozen base Linears (attn+mlp)", flush=True)
     adapters = inject_lora(dit, lc.rank, lc.alpha,
                            include_txtfusion=lc.target_txtfusion,
                            include_txtmlp=lc.target_txtmlp) \
         if lc.train_transformer else {}          # train_transformer=False -> TE-only (DiT frozen)
-    # fp8 REQUIRES grad-ckpt: else the per-forward dequant is retained for backward across every layer,
-    # erasing the saving (and OOM-ing). Force it on when fp8 is active.
+    # fp8 requires gradient checkpointing: otherwise the per-forward dequant is retained for backward
+    # across every layer, erasing the memory saving. Force it on when fp8 is active.
     if fp8_base and not o.grad_checkpointing:
         print("note: enabling gradient checkpointing (required by the fp8 base)", flush=True)
     dit.gradient_checkpointing = o.grad_checkpointing or fp8_base
@@ -157,6 +157,23 @@ def main():
         # so the text encoding agrees with the latent refs — dropped samples are encoded text-only and
         # the mask travels to edit_training_step as ref_drop. Validation keeps it off.
         samples = [load_sample(p, device) for p in paths]
+        # Reference-order augmentation: permute a sample's references AND rewrite its caption's
+        # image_k mentions together, so the ordinal stays truthful while the slot layout varies.
+        if cfg.data.ref_permute_prob > 0.0 and samples[0].get("refs"):
+            for _i, _s in enumerate(samples):
+                _n = len(_s["refs"])
+                if _n < 2 or rng.random() >= cfg.data.ref_permute_prob:
+                    continue
+                _perm = list(range(_n))
+                rng.shuffle(_perm)
+                if _perm == list(range(_n)):
+                    continue
+                _s = dict(_s)                                   # never mutate the cached payload
+                _s["refs"] = [_s["refs"][j] for j in _perm]
+                if _s.get("ref_paths"):
+                    _s["ref_paths"] = [_s["ref_paths"][j] for j in _perm]
+                _s["caption"] = permute_reference_order(_s["caption"], _n, _perm)
+                samples[_i] = _s
         gh, gw = samples[0]["grid_h"], samples[0]["grid_w"]
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)
         ref_drop = None
@@ -167,8 +184,12 @@ def main():
                 from PIL import Image
 
                 from sample_edit import _vlm_resize
-                vlm_imgs = [_vlm_resize(Image.open(s["ref_paths"][0]), cfg.data.vlm_image_size)
-                            for s in samples]
+                # One GROUP of images per sample, in the same order the refs are packed as latents,
+                # so a caption saying "image_2" resolves to refs[1] in both the text encoder and the
+                # DiT stream. Passing only ref_paths[0] leaves multi-reference composition
+                # instructions ungroundable (the encoder never sees the second subject).
+                vlm_imgs = [[_vlm_resize(Image.open(p_), cfg.data.vlm_image_size)
+                             for p_ in s["ref_paths"]] for s in samples]
             if vlm_imgs is not None and drop_refs and cfg.data.ref_dropout_prob > 0.0:
                 ref_drop = torch.rand(len(samples)) < cfg.data.ref_dropout_prob
                 ctx, mask = encode_text_with_ref_dropout(encoder, caps, vlm_imgs, ref_drop)
@@ -186,6 +207,15 @@ def main():
             ctx, mask = ctx.to(device), mask.to(device)
         refs = ref_grids = None
         if samples[0].get("refs"):                          # edit / multiref / style cache
+            # Caches are bucketed by TARGET grid only, so a batch can mix reference COUNTS; taking
+            # the signature from sample 0 would raise a bare IndexError or silently apply sample 0's
+            # grids to everyone. Fail loudly -- multi-reference batching needs ref-count bucketing.
+            n_ref0 = len(samples[0]["refs"])
+            if any(len(s["refs"]) != n_ref0 for s in samples):
+                raise RuntimeError(
+                    f"batch mixes different reference counts {sorted({len(s['refs']) for s in samples})}: "
+                    f"caches are bucketed by target grid only, so multi-reference data requires "
+                    f"batch=1 (or bucketing by ref-count)")
             ref_grids = [(r["grid_h"], r["grid_w"]) for r in samples[0]["refs"]]
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]

@@ -104,7 +104,9 @@ def flow_loss(
 
   if weight is not None:
     weight = weight.to(per_sample.dtype)
-    return (per_sample * weight).sum() / weight.sum().clamp_min(eps)
+    # Scale each sample's loss by its own timestep weight, then average. Do NOT normalise by the
+    # batch weight sum: that makes the weight self-cancel at batch=1 and batch-relative otherwise.
+    return (per_sample * weight).mean()
   return per_sample.mean()
 
 
@@ -282,7 +284,7 @@ class EmaModel:
   Construct with ``named_tensors`` = ``{name: live Tensor}`` (the actual parameters,
   not copies -- the optimizer updates them in place and ``update`` reads them back).
   For a full-FT model pass the float entries of ``model.state_dict()``; for LoRA pass
-  the adapter tensors. The shadow lives on the host, so a 12B EMA costs ~0 VRAM.
+  the adapter tensors. The shadow lives on the host, so the EMA adds no GPU memory.
 
   ``every`` strides the host copy (the decay is compounded as ``decay**every`` so the
   effective time-constant is unchanged) -- a per-step copy of every weight would
@@ -290,7 +292,7 @@ class EmaModel:
 
   ``store()/copy_to()/restore()`` swap the EMA weights into the live tensors for
   sampling or a format-specific save, then put the originals back. ``write_safetensors``
-  serialises the EMA weights directly (no swap, no VRAM spike) given a key template.
+  serialises the EMA weights directly, without swapping into the live tensors, given a key template.
   """
 
   def __init__(self, named_tensors, decay: float = 0.999, *, every: int = 1):

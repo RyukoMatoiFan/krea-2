@@ -41,7 +41,7 @@ def _vlm_resize(im, max_side):
 def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", device="cuda",
                 dtype=torch.bfloat16, width=1024, height=1024, steps=28, guidance=4.5, seed=0,
                 minres=256, maxres=1280, y1=0.5, y2=1.15, mu=None,
-                ref_t0=True, vlm_cond=False, vlm_image_size=384):
+                ref_t0=True, vlm_cond=False, vlm_image_size=384, uncond="zero"):
     """Denoise a single target conditioned on a text prompt + clean reference image(s).
 
     ``ref_t0`` gives the clean reference tokens a t=0 modulation in the DiT (matches training).
@@ -67,16 +67,31 @@ def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", 
     x_t = patchify(noise, patch)            # (1, n_tgt, 64)
     n_tgt = x_t.shape[1]
 
-    # VLM dual conditioning: the (first) reference image also goes through the Qwen3-VL vision tower
-    # into the text embeddings. ``_forward_mm`` carries one image per prompt, so pass the primary
-    # source; all refs still ride along as clean latents above.
-    vlm_imgs = [_vlm_resize(ref_images[0], vlm_image_size)] if (vlm_cond and ref_images) else None
+    # VLM dual conditioning: the reference images also go through the Qwen3-VL vision tower into the
+    # text embeddings. ALL refs are passed (as one nested group for this single prompt) in the same
+    # order they are packed as latents, so a caption saying "image_2" refers to refs[1] both in the
+    # text encoder and in the DiT stream. Passing only refs[0] would leave multi-reference
+    # instructions ungroundable.
+    vlm_imgs = ([[_vlm_resize(im, vlm_image_size) for im in ref_images]]
+                if (vlm_cond and ref_images) else None)
 
     cfg = guidance > 0
     txt, txtmask = encoder([prompt], images=vlm_imgs)
     pos, mask = build_pos_mask(glat_h, glat_w, txtmask, ref_grids=ref_grids)
     if cfg:
-        untxt, untxtmask = encoder([negative_prompt], images=vlm_imgs)
+        if negative_prompt:
+            # Explicit negative prompt: encode it (with the same VLM images, so only the TEXT differs).
+            untxt, untxtmask = encoder([negative_prompt], images=vlm_imgs)
+        elif uncond == "empty":
+            # Legacy branch: encode the empty string WITH the vlm images. Kept only so the two
+            # unconditional definitions can be compared directly -- see `uncond="zero"`.
+            untxt, untxtmask = encoder([""], images=vlm_imgs)
+        else:
+            # Match the branch the model was actually TRAINED to represent. `cfg_dropout` zeroes the
+            # whole context tensor -- text AND vlm image tokens -- so an encoded empty prompt is not
+            # the unconditional the model learned; guidance against it subtracts an out-of-
+            # distribution condition. Reuse the conditional's shape/mask and zero the content.
+            untxt, untxtmask = torch.zeros_like(txt), txtmask
         unpos, unmask = build_pos_mask(glat_h, glat_w, untxtmask, ref_grids=ref_grids)
 
     # mu-shift uses the TARGET image-token count (matches get_schedule_for_seqlen in training).

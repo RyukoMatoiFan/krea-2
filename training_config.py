@@ -45,6 +45,11 @@ class PathsConfig:
   ckpt_dir: str = ""         # "" -> f"{output_dir}/ckpts"
   results_dir: str = ""
   resume_from: str = ""      # crash recovery: "auto" = resume the same run from {ckpt_dir} marker
+  # Weights-only WARM START for the text encoder, mirroring dit_repo/dit_file for the DiT. Without
+  # this a warm-started DiT is paired with a BASE Qwen3-VL even though it was co-trained against a
+  # drifted one -- resume_from would carry the TE, but it also restores optimizer/scheduler state
+  # (including a decayed LR), which is exactly what a fresh run must NOT inherit.
+  te_init: str = ""          # path to te_*.safetensors (full encoder OR TE-LoRA adapters)
 
 
 @dataclass
@@ -83,6 +88,11 @@ class DataConfig:
   mask_quantile: float = 0.5
   mask_bg_weight: float = 0.0
   ref_dropout_prob: float = 0.0    # (edit/multiref/style) per-sample reference dropout for CFG on refs
+  ref_permute_prob: float = 0.0    # (multiref) per-sample probability of permuting reference ORDER
+                                   # and rewriting the caption's image_k mentions to match. Blocks
+                                   # the slot-convention shortcut: without it a model can satisfy
+                                   # the objective by learning "the background is always image_1"
+                                   # instead of reading which image the instruction names.
   edit_vlm_cond: bool = False      # (edit) also feed the source image through the Qwen3-VL vision tower
   vlm_image_size: int = 384        # max source-image side for the VLM conditioning path
   train_list: str = ""             # JSON list of cache filenames (repeats = oversampling)
@@ -99,7 +109,10 @@ class OptimConfig:
   accum: int = 1
   warmup: int = 200
   optimizer: str = "adamw"   # LoRA: adamw | adamw8bit | prodigy | schedule_free | came
-  grad_clip: float = 1.0
+  grad_clip: float = 1.0     # PER-TENSOR norm clip, NOT a global model-norm clip: the fused
+                             # per-parameter backward frees each grad immediately, so no global
+                             # norm can be formed. Each tensor is bounded by this value, but the
+                             # aggregate model norm can reach ~sqrt(n_tensors) * grad_clip.
   grad_checkpointing: bool = True
   cfg_dropout_prob: float = 0.1
   use_ema: bool = False            # maintain an EMA of the trained weights (LoRA adapter or full DiT)
@@ -111,13 +124,23 @@ class OptimConfig:
   num_restarts: int = 1            # cycles for cosine_restarts
   offload_optimizer: bool = False  # full-FT: keep Adam moments in CPU RAM (lower VRAM, host-RAM cost)
   blocks_to_swap: int = 0          # page N deepest blocks CPU<->GPU per fwd/bwd (LoRA: frozen base only; full-FT pages all, slower)
-  quantize_base: str = ""          # LoRA: "" off | "fp8" -> e4m3-quantize the frozen base blocks (~half base VRAM)
+  quantize_base: str = ""          # LoRA: "" off | "fp8" -> e4m3-quantize the frozen base blocks to save memory
   weight_decay: float = 0.01       # full-FT AdamW weight decay
   te_lr: float = 0.0               # joint full-FT: separate (lower) LR for the text encoder;
                                    # 0 -> lr/10 when training the DiT too, else lr (TE-only stage)
+                                   # (te_lr = 0 also means "TE frozen" -- the third TE arm)
+  te_mode: str = "full"            # how the TE trains when te_lr>0: full = fine-tune all Qwen3-VL
+                                   # weights | lora = frozen base + TE-LoRA adapters (lora.te_rank).
+                                   # 'lora' is the safer default on a narrow single-domain corpus,
+                                   # where full-FT of a chat-VLM encoder risks catastrophic
+                                   # forgetting; it also cuts the TE checkpoint from ~9.6GB to MBs.
   train_dit: bool = True           # joint trainer: also full-FT the DiT. False = DiT frozen, TE-only
   optimizer_state: str = "adafactor"  # full-FT moment backend: adamw (offload) | adafactor (on-GPU)
   preload_caches: bool = True      # full-FT trainers: preload latent caches into RAM
+  # --- patience early-stopping, driven by logging.eval_steps/eval_scorer ---
+  early_stop_patience: int = 0     # 0 = off; stop after N consecutive evals with no improvement
+  early_stop_min_delta: float = 0.0  # smallest improvement that COUNTS (set to the smallest delta
+                                     # you'd act on, so metric noise can't keep resetting patience)
 
 
 @dataclass
@@ -147,6 +170,25 @@ class LoggingConfig:
   sample_guidance: float = 4.5
   sample_count: int = 4       # how many prompts/items to sample each time
   edit_preview_manifest: str = ""  # edit runs: JSON list of {src,instruction,tgt}; renders [src|edit|tgt] rows + a step-0 base sheet
+  # --- quality-eval schedule + metric-driven checkpoint retention (see eval_control.py) ---
+  eval_steps: str = ""        # "" off | "log[:ratio[:start]]" (dense early, sparse late) |
+                              # "every:N" uniform | explicit "500,1000,2000". Renders a preview at
+                              # each listed step and scores it -> drives keep_best / early stop.
+  eval_scorer: str = ""       # "module:function" returning a float (kwargs: sheet_path, examples,
+                              # step). "" -> fall back to val_loss (requires val_every/val data).
+  eval_metric_mode: str = "max"   # max = larger is better (quality) | min = smaller is better (loss)
+  keep_last: int = 2          # step-tagged checkpoints retained by RECENCY (was hardcoded 2)
+  keep_best: int = 0          # 0 = off; retain N best-by-metric checkpoints under a separate
+                              # `*_best_step*` namespace the recency rotation never touches
+  # Multi-criterion selection. The scorer may return a DICT of named metrics; these order them.
+  eval_criteria: str = ""     # "" -> single scalar using eval_metric_mode. Else an ORDERED,
+                              # LEXICOGRAPHIC list "name:max|min[:tie_tol],..." e.g.
+                              # "compliance:max:0.01,quality:max" -- quality only breaks ties.
+                              # Deliberately not a weighted sum: a sum lets a model trade a broken
+                              # primary objective for a prettier picture.
+  eval_guardrails: str = ""   # HARD gates, "name:max|min:threshold,..." e.g. "single_ref:min:0.80".
+                              # A checkpoint violating any guardrail can never be "best", however
+                              # good its ranked criteria (used for "must not regress single-ref").
   tracker: str = "tensorboard"  # none | wandb | tensorboard (mirrors metrics.jsonl scalars)
   wandb_project: str = "krea2"
   run_name: str = ""          # tracker run name ("" -> backend default)
@@ -347,7 +389,7 @@ def apply_runtime(cfg: TrainConfig) -> None:
   # mmdit.py decorates RMSNorm / PositionalEncoding / LastLayer with @torch.compile(fullgraph=True).
   # During training (+ grad-checkpointing) and the no-grad sampler, grad-mode and sequence shapes
   # change, thrashing dynamo's recompile limit and HARD-failing previews (fullgraph=True). Compile
-  # is an inference nicety we don't need for training correctness -> disable dynamo for our runs.
+  # is an inference nicety not needed for training correctness -> disable dynamo during training.
   os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
   try:
     import torch._dynamo

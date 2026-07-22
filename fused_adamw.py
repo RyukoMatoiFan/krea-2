@@ -1,12 +1,12 @@
 """Memory-efficient full fine-tuning: fused-back-pass AdamW with bf16 stochastic rounding.
 
-Two standard techniques that together make a large (>=10B) full fine-tune fit on a single 80GB GPU:
+Two standard techniques that together make a large full fine-tune fit on a single GPU:
 
   * **Stochastic rounding** (Zamirai et al. 2020, "Revisiting BFloat16 Training",
     arXiv:2010.06192): update bf16 weights/states directly with no fp32 master copy. A
     naive bf16 += tiny update rounds to zero; stochastic rounding keeps the update in
-    expectation, so we drop the fp32 master (halves weight memory) without the usual
-    bf16 staleness. ``copy_stochastic_`` is the standard mantissa-dither implementation.
+    expectation, so the fp32 master is dropped without the usual bf16 staleness.
+    ``copy_stochastic_`` is the standard mantissa-dither implementation.
 
   * **Fused back pass** (driven by the trainer via register_post_accumulate_grad_hook):
     ``step_parameter`` runs the AdamW update for ONE parameter as soon as its grad is
@@ -17,7 +17,7 @@ Two standard techniques that together make a large (>=10B) full fine-tune fit on
 ``patch_adamw`` monkeypatches a stock ``torch.optim.AdamW`` to gain ``.step_parameter(p, group, i)``;
 the trainer drives the update via per-parameter grad hooks (the optimizer's normal ``.step()`` is
 unused on this path). For Krea 2 (clean bf16 base, no fp8) this module is used unchanged; the on-GPU
-Adafactor backend (``build_fused_adafactor``) is the recommended one for the 12B DiT (+ Qwen3-VL TE).
+Adafactor backend (``build_fused_adafactor``) is the recommended one for the DiT (+ Qwen3-VL TE).
 """
 from __future__ import annotations
 
@@ -218,18 +218,28 @@ def step_adafactor_parameter(self, p: Tensor, group: dict, i: int) -> None:
   lr_t = group["lr"] * max(eps2, p_rms)
   delta = upd.mul_(-lr_t)
 
+  # Decoupled weight decay (AdamW-style), applied to the parameter rather than the gradient so it
+  # does not enter the second-moment estimate.
+  wd = float(group.get("weight_decay") or 0.0)
+  if wd:
+    delta = delta.add_(p.to(delta.dtype), alpha=-group["lr"] * wd)
+
   if p.dtype == torch.bfloat16 and getattr(self, "stochastic_rounding", False):
     add_stochastic_(p, delta)
   else:
     p.add_(delta.to(p.dtype))
 
 
-def build_fused_adafactor(params, lr: float, *, stochastic_rounding: bool = True) -> AdamW:
+def build_fused_adafactor(params, lr: float, *, weight_decay: float = 0.0,
+                          stochastic_rounding: bool = True) -> AdamW:
   """AdamW shell (only as a param-group/state holder) patched to take per-parameter
   Adafactor steps. State lives ON GPU (tiny, factored) -> no CPU offload, so single-GPU
   full-FT of very large models stays fast. Drive it via the per-parameter grad hooks
-  exactly like build_fused_adamw (its .step() is unused)."""
-  opt = AdamW(params, lr=lr, foreach=False, fused=False)
+  exactly like build_fused_adamw (its .step() is unused).
+
+  ``weight_decay`` is applied decoupled inside ``step_adafactor_parameter``; it must be threaded
+  through here or the configured value never reaches the update."""
+  opt = AdamW(params, lr=lr, weight_decay=weight_decay, foreach=False, fused=False)
   opt.stochastic_rounding = stochastic_rounding
   opt.offload_states = False
   opt.step_parameter = step_adafactor_parameter.__get__(opt, AdamW)

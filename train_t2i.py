@@ -20,6 +20,8 @@ single (grid_h, grid_w).
 """
 from __future__ import annotations
 
+import re as _re
+
 import torch
 from torch import Tensor
 
@@ -32,6 +34,7 @@ def build_pos_mask(
     text_mask: Tensor,
     *,
     ref_grids: list[tuple[int, int]] | None = None,
+    ref_drop_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Build combined ``pos`` (B, S, 3) and ``mask`` (B, S) for ``[text][refs...][target]``.
 
@@ -53,7 +56,14 @@ def build_pos_mask(
         ids[..., 1] = torch.arange(gh, device=device)[:, None]
         ids[..., 2] = torch.arange(gw, device=device)[None, :]
         pos_blocks.append(ids.reshape(gh * gw, 3))
-        mask_blocks.append(torch.ones(B, gh * gw, dtype=torch.bool, device=device))
+        # Reference positions are attention-masked for reference-dropped samples so the no-reference
+        # branch is genuinely reference-free. Zeroing the latents is not enough: a zero token still
+        # passes the biased input projection to a constant token occupying its own RoPE frame, from
+        # which the model could read the reference count, geometry and frame identity.
+        blk = torch.ones(B, gh * gw, dtype=torch.bool, device=device)
+        if ref_drop_mask is not None and j != n_ref:      # target block (j == n_ref) always visible
+            blk = blk & ~ref_drop_mask.to(device=device, dtype=torch.bool).view(B, 1)
+        mask_blocks.append(blk)
 
     pos = torch.cat(pos_blocks, dim=0).unsqueeze(0).expand(B, -1, -1)  # (B, S, 3)
     mask = torch.cat(mask_blocks, dim=1)                              # (B, S)
@@ -160,6 +170,32 @@ def t2i_training_step(
     return flow_loss(pred.float(), v_target, weight=weight)
 
 
+
+_ORD_RE = _re.compile(r"image[_ ]?(\d+)", _re.I)
+
+
+def permute_reference_order(caption: str, n_refs: int, perm: list) -> str:
+    """Rewrite ``image_k`` mentions to follow a reference permutation.
+
+    ``perm`` is read as "new position i now holds the reference that was at ``perm[i]``". A caption
+    that said ``image_{old+1}`` must therefore say ``image_{new+1}`` where ``perm[new] == old``.
+
+    Why this exists: each reference occupies its own RoPE frame, so a model can satisfy the training
+    objective by learning the DATASET's slot convention ("the background is always image_1") instead
+    of reading the instruction. Permuting the references without rewriting the caption would teach
+    the opposite of role binding; rewriting both together is what makes the ordinal informative.
+    Rewriting is ATOMIC (single regex pass) -- sequential replacement collapses ordinals onto each
+    other, e.g. 1->2 followed by 2->3 turns every original 1 into a 3.
+    """
+    inv = {old: new for new, old in enumerate(perm)}
+
+    def sub(m):
+        k = int(m.group(1)) - 1
+        return f"image_{inv.get(k, k) + 1}" if 0 <= k < n_refs else m.group(0)
+
+    return _ORD_RE.sub(sub, caption or "")
+
+
 def edit_training_step(
     dit,
     *,
@@ -229,7 +265,9 @@ def edit_training_step(
             r[rdrop] = 0
 
     img = torch.cat([*ref_tokens, x_t], dim=1)  # [refs..., target] along the sequence
-    pos, mask = build_pos_mask(grid_h, grid_w, text_mask, ref_grids=ref_grids)
+    # Pass the dropout mask so dropped references are ATTENTION-MASKED, not merely zeroed.
+    pos, mask = build_pos_mask(grid_h, grid_w, text_mask, ref_grids=ref_grids,
+                               ref_drop_mask=rdrop)
 
     # Number of leading (clean) reference image tokens -> the DiT gives them t=0 modulation when ref_t0.
     ref_len = sum(int(r.shape[1]) for r in ref_tokens) if ref_t0 else 0
