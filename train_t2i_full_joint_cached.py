@@ -623,40 +623,64 @@ def main():
         print(f"EMA on: decay={o.ema_decay}, every={o.ema_every} (CPU fp32 shadow)", flush=True)
 
     # ----- Held-out validation: plain MSE at fixed schedule quantiles (low variance) -----
-    val_groups = {}
-    for p in eval_paths:
-        d = load_sample(p, device)
-        val_groups.setdefault((int(d["grid_h"]), int(d["grid_w"])), []).append(p)
+    def _val_batches(paths):
+        out = []
+        for (gh, gw), grp in _group_by_grid(paths).items():
+            vsched = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
+                                             max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
+                                             max_seq_len=fl.max_image_seq_len)
+            for i in range(0, len(grp), o.batch):
+                chunk = grp[i:i + o.batch]
+                out.append(((collate(chunk), vsched), len(chunk)))
+        return out
 
-    def run_val():
+    def _group_by_grid(paths):
+        g = {}
+        for p in paths:
+            d = load_sample(p, device)
+            g.setdefault((int(d["grid_h"]), int(d["grid_w"])), []).append(p)
+        return g
+
+    # Split the holdout by capability so a combined val_loss cannot mask one arm regressing while
+    # the other improves. Cache-index convention: single-ref (text-driven edit) < 300000; multi-
+    # reference (reference-driven) >= 300000. Both are reported; the COMBINED value drives the stop.
+    _val_text = [p for p in eval_paths if int(os.path.basename(p)[:6]) < 300000]
+    _val_ref = [p for p in eval_paths if int(os.path.basename(p)[:6]) >= 300000]
+
+    def run_val(breakdown=None):
+        # Put BOTH the DiT and the (live) text encoder in eval mode: val re-encodes captions through
+        # the encoder, so a train-mode encoder would apply dropout and give a noisy, non-comparable
+        # val_loss. Restore both afterwards.
         was_training = dit.training
+        enc_was_training = encoder.qwen.training if encoder is not None else None
         dit.eval()
+        if encoder is not None:
+            encoder.qwen.eval()
+
+        def loss_fn(packed, q):
+            (z0, ctx, mask, gh, gw, refs, ref_grids, _), vsched = packed
+            t = float(vsched(torch.tensor([float(q)])).item())
+            g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
+            if refs is not None:
+                return edit_training_step(dit, z0=z0, refs=refs, ref_grids=ref_grids, context=ctx,
+                                          text_mask=mask, grid_h=gh, grid_w=gw, schedule=vsched,
+                                          flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
+                                          ref_dropout_prob=0.0, t_override=t, disable_weighting=True)
+            return t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
+                                     schedule=vsched, flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
+                                     t_override=t, disable_weighting=True)
+
         with torch.no_grad():
-            batches = []
-            for (gh, gw), paths in val_groups.items():
-                vsched = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
-                                                 max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
-                                                 max_seq_len=fl.max_image_seq_len)
-                for i in range(0, len(paths), o.batch):
-                    chunk = paths[i:i + o.batch]
-                    batches.append(((collate(chunk), vsched), len(chunk)))
-
-            def loss_fn(packed, q):
-                (z0, ctx, mask, gh, gw, refs, ref_grids, _), vsched = packed
-                t = float(vsched(torch.tensor([float(q)])).item())
-                g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
-                if refs is not None:
-                    return edit_training_step(dit, z0=z0, refs=refs, ref_grids=ref_grids, context=ctx,
-                                              text_mask=mask, grid_h=gh, grid_w=gw, schedule=vsched,
-                                              flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
-                                              ref_dropout_prob=0.0, t_override=t, disable_weighting=True)
-                return t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
-                                         schedule=vsched, flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
-                                         t_override=t, disable_weighting=True)
-
-            v = compute_val_loss(loss_fn, batches)
+            v = compute_val_loss(loss_fn, _val_batches(eval_paths))
+            if breakdown is not None:
+                if _val_text:
+                    breakdown["val_loss_text"] = compute_val_loss(loss_fn, _val_batches(_val_text))
+                if _val_ref:
+                    breakdown["val_loss_ref"] = compute_val_loss(loss_fn, _val_batches(_val_ref))
         if was_training:
             dit.train()
+        if enc_was_training:
+            encoder.qwen.train()
         return v
 
     # ----- Checkpoint = DiT weights (+TE) + resume state (+EMA weights) + marker -----
@@ -833,7 +857,7 @@ def main():
         if best.stale:
             print("[eval] NOTE: existing best.json was from a different experiment "
                   "(fingerprint/mode mismatch) -> starting best/patience state fresh", flush=True)
-        if scorer is None and not val_groups:
+        if scorer is None and not eval_paths:
             raise SystemExit("eval_steps is set but nothing can score it: no logging.eval_scorer "
                              "and no held-out val data. Set eval_scorer or provide val caches.")
     # Step-0 baseline for t2i previews (edit-mode base is handled before the resume load above).
@@ -893,6 +917,9 @@ def main():
                             opt.step_parameter(p, group, 0)
                         if p.grad is not None:
                             p.grad = None
+        # The weight update for this step has now been applied -> mark step+1 completed so an interrupt
+        # checkpoint saves the post-update step count (else resume redoes this step: one extra update).
+        _state["step"] = step + 1
         # Fold this step's per-group total grad norm (sqrt of summed per-param norm^2) into the
         # interval mean, then reset the per-step accumulator. Only when an optimizer step happened.
         if fused or (step + 1) % o.accum == 0:
@@ -948,12 +975,17 @@ def main():
             gcnt = 0
             t0 = time.time()
 
-        if lg.val_every and (step + 1) % lg.val_every == 0 and val_groups:
-            vrec = {"step": step + 1, "val_loss": run_val()}
+        # Skip this cheap val when the log-spaced eval schedule already covers this step -- that path
+        # runs val too (for the scorer) and now logs the same breakdown, so running both would compute
+        # val twice at the coinciding step.
+        if (lg.val_every and (step + 1) % lg.val_every == 0 and eval_paths
+                and (step + 1) not in eval_step_set):
+            _bd = {}
+            vrec = {"step": step + 1, "val_loss": run_val(breakdown=_bd), **_bd}
             with open(metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(vrec) + "\n")
-            tracker.log({"val_loss": vrec["val_loss"]}, vrec["step"])
-            print({"step": vrec["step"], "val_loss": round(vrec["val_loss"], 5)}, flush=True)
+            tracker.log({k: v for k, v in vrec.items() if k != "step"}, vrec["step"])
+            print({k: (round(v, 5) if isinstance(v, float) else v) for k, v in vrec.items()}, flush=True)
             t0 = time.time()  # don't bill val wall-time to the next step's s/step
 
         if lg.ckpt_every and (step + 1) % lg.ckpt_every == 0 and o.train_dit:
@@ -981,8 +1013,15 @@ def main():
                 do_preview(f"step{step + 1:06d}")
                 if scorer is not None:
                     score = float(scorer(sheet_path=sheet, examples=edit_examples, step=step + 1))
-                elif val_groups:
-                    score = run_val()
+                elif eval_paths:
+                    _bd = {}
+                    score = run_val(breakdown=_bd)
+                    _vrec = {"step": step + 1, "val_loss": score, **_bd}
+                    with open(metrics_path, "a", encoding="utf-8") as _f:
+                        _f.write(json.dumps(_vrec) + "\n")
+                    tracker.log({k: v for k, v in _vrec.items() if k != "step"}, step + 1)
+                    print({k: (round(v, 5) if isinstance(v, float) else v)
+                           for k, v in _vrec.items()}, flush=True)
             except Exception as e:
                 print(f"[eval] render/scorer failed: {type(e).__name__} {e}", flush=True)
                 score = None

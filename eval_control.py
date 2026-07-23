@@ -211,8 +211,12 @@ class BestTracker:
                     self._remove(e["step"])
             self.entries = kept
             self.best_value = (min(kept, key=self._rank_key)["value"] if kept else None)
-            self.since_improved = 0
-            self._save()
+        # ALWAYS reset patience on resume, even when no top-N entry was dropped: a future non-improving
+        # eval increments since_improved without ever entering the top-N `entries`, so the entry-diff
+        # above cannot see it. Restarting patience from the resume point is conservative (it can only
+        # DELAY early-stop, never trigger it spuriously); best-N retention still protects the peak.
+        self.since_improved = 0
+        self._save()
         return before - len(kept)
 
     # -- comparison -------------------------------------------------------- #
