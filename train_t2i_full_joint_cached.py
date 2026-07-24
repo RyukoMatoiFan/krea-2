@@ -256,13 +256,39 @@ def render_previews(dit, vae, encoder, prompts, out_path, *, res, steps, guidanc
         torch.cuda.empty_cache()
 
 
+def _montage_refs(refs, res):
+    """Arrange 1..N reference images into a single ``res``x``res`` cell as a near-square grid.
+
+    One ref fills the cell; 2 sit side by side; 3-4 -> 2x2; 5-6 -> 2x3; 7-9 -> 3x3. A grid keeps each
+    reference roughly square and legible even at 7 refs, instead of the thin vertical slivers a single
+    side-by-side row would give. Empty grid slots stay black.
+    """
+    import math
+
+    from PIL import Image as _Image
+
+    n = len(refs)
+    if n == 1:
+        return refs[0].resize((res, res))
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    tw, th = res // cols, res // rows
+    cell = _Image.new("RGB", (res, res), (0, 0, 0))
+    for i, r in enumerate(refs):
+        cx, cy = (i % cols) * tw, (i // cols) * th
+        cell.paste(r.resize((tw, th)), (cx, cy))
+    return cell
+
+
 def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, guidance, seed,
                          vlm_cond=False, vlm_image_size=384):
-    """Edit contact-sheet: one row per example, columns [source | model edit | target (if given)].
+    """Edit contact-sheet: one row per example, columns [ref(s) | model edit | target (if given)].
 
-    ``examples`` = list of {"src": path, "instruction": str, "tgt": path?}. Rendered at the training
-    resolution (square, matching precache_edit) so a step-0 render is the base model's edit attempt
-    and later sheets show the same fixed edits improving toward the ground-truth target column.
+    ``examples`` = list of {"instruction": str, "tgt": path?} plus EITHER "src" (single-reference edit)
+    OR "refs": [path, ...] (multi-reference composition). Both are handled so one sheet can mix
+    text-driven single-source edits and reference-driven multi-ref composition. Rendered at the
+    training resolution (square) so a step-0 sheet is the base model's attempt and later sheets show
+    the same fixed examples improving toward the ground-truth target column.
     """
     from PIL import Image
 
@@ -272,11 +298,19 @@ def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, g
     try:
         rows = []
         for ex in examples:
-            src = Image.open(ex["src"]).convert("RGB")
-            edited = edit_sample(dit, vae, encoder, ex["instruction"], [src],
+            ref_paths = ex.get("refs") or ([ex["src"]] if ex.get("src") else [])
+            refs = [Image.open(p).convert("RGB") for p in ref_paths]
+            edited = edit_sample(dit, vae, encoder, ex["instruction"], refs,
                                  width=res, height=res, steps=steps, guidance=guidance, seed=seed,
                                  vlm_cond=vlm_cond, vlm_image_size=vlm_image_size)
-            cells = [src.resize((res, res)), edited]
+            # ALL references go into a SINGLE source cell so every row stays exactly
+            # [source | model-edit | target] = 3 columns -- keeps the dashboard's fixed 3-way slice
+            # correct while still showing every reference (a variable per-row column count instead
+            # pads short rows with black and the dashboard then mis-slices: black "ground truth",
+            # noise bleeding into "source"). Refs are arranged in a near-square GRID rather than a
+            # single row so many references (up to 7) stay legible instead of thin vertical slivers.
+            src_cell = _montage_refs(refs, res)
+            cells = [src_cell, edited]
             if ex.get("tgt") and os.path.exists(ex["tgt"]):
                 cells.append(Image.open(ex["tgt"]).convert("RGB").resize((res, res)))
             rows.append(cells)
