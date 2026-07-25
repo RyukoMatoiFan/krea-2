@@ -35,14 +35,29 @@ grounding JSON). Multi-GPU: `--num-shards N --shard K` (one process per GPU).
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_t2i_full_joint_cached.py --config config/t2i_full.yaml [--smoke]
 ```
-Single-GPU. The 12B DiT (+ optional Qwen3-VL TE) fits one 80GB H100 via the memory recipe in
-`fused_adamw.py`: fused per-parameter backward (`accum: 1`) + on-GPU Adafactor (`optimizer_state:
+Single-GPU training uses the memory recipe in `fused_adamw.py`: fused per-parameter backward
+(`accum: 1`) + on-GPU Adafactor (`optimizer_state:
 adafactor`) + gradient checkpointing + bf16 stochastic rounding. `--smoke` runs ~20 steps + one
 preview then exits (`SMOKE OK`). DiT-only when caches hold `llm_text` and `te_lr: 0`; set `te_lr`
 (e.g. `1e-6`) to jointly fine-tune the text encoder.
 
 Flow-matching convention (see `constants.py`): **t=1 noise, t=0 data**, `x_t = t·noise + (1-t)·x0`,
 velocity target `v = noise - x0`. Timesteps use Krea's resolution-aware `mu` shift (`scheduler.py`).
+
+For reference-conditioned datasets, cache behavior is declared explicitly rather than inferred from
+filenames. Manifest rows accepted by `precache_edit.py` may set `reference_delta_mask: true` when
+the first reference is spatially aligned with the target and should define a delta-based loss mask.
+They may also set a neutral `validation_group` label for subgroup metrics. Existing caches can use
+`data.cache_annotations`, a JSON object keyed by cache filename with the same optional fields:
+
+```json
+{
+  "example.pt": {
+    "reference_delta_mask": true,
+    "validation_group": "primary"
+  }
+}
+```
 
 ## 2b. LoRA
 
@@ -85,28 +100,20 @@ low-variance held-out flow-matching loss on the `data.n_eval_holdout` eval split
 only for its forward/backward (`SingleStreamDiT.enable_block_swap`). It pairs with gradient
 checkpointing — the backward recompute re-pages a block in exactly when needed — and trades VRAM for
 host↔device copies (slower). Primary use is the **LoRA** trainer: only the frozen base is paged, so
-adapters stay resident and trainable. The full-FT trainer also supports it (it must page trainable
-weights too — noticeably slower; full-FT already fits one 80GB GPU, so leave it `0` there unless
-pushing resolution/batch). At 1024 with 14/28 blocks swapped, a LoRA run drops peak VRAM
-**~31 → 20 GB** (−36%) for ~1.4× the per-step time; training dynamics are unchanged.
+adapters stay resident and trainable. The full-FT trainer also supports it, although paging
+trainable weights adds transfer overhead. Enable it when the selected resolution and batch size
+need a lower device-memory footprint.
 
 ```bash
 KREA2_OPTIM__BLOCKS_TO_SWAP=14 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
 ```
 
 `optim.quantize_base: fp8` (LoRA only) stores the frozen base's attention+MLP weights in 8-bit (e4m3,
-per-row scale) and dequantizes on the fly, roughly halving the resident base. It **requires gradient
+per-row scale) and dequantizes on the fly to reduce the resident base. It **requires gradient
 checkpointing** — the per-forward dequant would otherwise be retained for the backward across every
 layer, erasing the saving — so the trainer enables it automatically when fp8 is on. The three levers
-compose with an unchanged loss curve (measured, rank-16 LoRA @768):
-
-| config | peak VRAM |
-|---|---|
-| baseline (bf16 base) | 28.8 GB |
-| `quantize_base: fp8` | 17.5 GB (−39%) |
-| fp8 + `blocks_to_swap: 14` | 11.9 GB (−59%) |
-
-A LoRA then fits a 16 GB (even 12 GB) card; ~1.9× per-step time with both on.
+compose without changing the training objective. Combining quantization and block swapping lowers
+device-memory use while adding dequantization and transfer overhead.
 
 ```bash
 KREA2_OPTIM__QUANTIZE_BASE=fp8 KREA2_OPTIM__BLOCKS_TO_SWAP=14 \

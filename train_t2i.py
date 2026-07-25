@@ -196,6 +196,36 @@ def permute_reference_order(caption: str, n_refs: int, perm: list) -> str:
     return _ORD_RE.sub(sub, caption or "")
 
 
+def augment_reference_order(
+    samples: list[dict], rng, probability: float, *, enabled: bool
+) -> list[dict]:
+    """Apply train-only reference-order augmentation without mutating cached payloads.
+
+    Validation passes ``enabled=False``. That path is a strict no-op and does not consume ``rng``,
+    keeping fixed validation independent of the training sampler and evaluation cadence.
+    """
+    if not enabled or probability <= 0.0 or not samples or not samples[0].get("refs"):
+        return samples
+    out = samples
+    for i, sample in enumerate(samples):
+        n_refs = len(sample["refs"])
+        if n_refs < 2 or rng.random() >= probability:
+            continue
+        perm = list(range(n_refs))
+        rng.shuffle(perm)
+        if perm == list(range(n_refs)):
+            continue
+        if out is samples:
+            out = list(samples)
+        changed = dict(sample)
+        changed["refs"] = [sample["refs"][j] for j in perm]
+        if sample.get("ref_paths"):
+            changed["ref_paths"] = [sample["ref_paths"][j] for j in perm]
+        changed["caption"] = permute_reference_order(sample.get("caption", ""), n_refs, perm)
+        out[i] = changed
+    return out
+
+
 def edit_training_step(
     dit,
     *,

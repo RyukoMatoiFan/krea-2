@@ -67,7 +67,7 @@ def main():
         raise SystemExit("slider.positive and slider.negative are required (the +/- attribute prompts)")
 
     dit = build_dit(cfg, device, dtype, load_weights=True, train=False)
-    low_vram = cfg.optim.quantize_base == "fp8"   # fits a 24GB card: fp8 base + free encoder in the loop
+    low_vram = cfg.optim.quantize_base == "fp8"   # keep the frozen base compact during encoding
     if low_vram:
         from quantize import quantize_dit_fp8
         quantize_dit_fp8(dit)

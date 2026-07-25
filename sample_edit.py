@@ -83,8 +83,8 @@ def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", 
             # Explicit negative prompt: encode it (with the same VLM images, so only the TEXT differs).
             untxt, untxtmask = encoder([negative_prompt], images=vlm_imgs)
         elif uncond == "empty":
-            # Legacy branch: encode the empty string WITH the vlm images. Kept only so the two
-            # unconditional definitions can be compared directly -- see `uncond="zero"`.
+            # Optional branch: encode the empty string with the VLM images for an
+            # image-conditioned unconditional context; see `uncond="zero"`.
             untxt, untxtmask = encoder([""], images=vlm_imgs)
         else:
             # Match the branch the model was actually TRAINED to represent. `cfg_dropout` zeroes the

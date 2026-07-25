@@ -11,11 +11,12 @@ optim:
   weight_decay: 0.01
   grad_clip: 1.0
   grad_checkpointing: true
-  optimizer_state: adafactor   # on-GPU factored 2nd moment -> fits the 12B DiT on one 80GB GPU
+  optimizer_state: adafactor   # on-GPU factored second moment reduces optimizer-state memory
   cfg_dropout_prob: 0.1
   lr_scheduler: cosine
   min_lr_ratio: 0.1
 data:
+  cache_annotations: ""     # optional filename-to-annotation JSON sidecar for existing caches
   resolution: 1024
   n_eval_holdout: 4
 flow:

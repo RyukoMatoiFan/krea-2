@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import time
@@ -32,17 +34,17 @@ from loading import build_dit, build_encoder, build_vae
 from lora import inject_lora_te, load_lora_weights, save_lora
 from provenance import write_manifest
 from scheduler import get_schedule_for_seqlen
-from train_t2i import (edit_training_step, encode_text_with_ref_dropout,
-                        permute_reference_order, t2i_training_step)
+from train_t2i import (augment_reference_order, edit_training_step,
+                        encode_text_with_ref_dropout, t2i_training_step)
 from trackers import Tracker
 from training_config import apply_runtime, dtype_of, load_config
 from training_utils import (
     EmaModel,
     build_lr_scheduler,
     compute_val_loss,
-    derive_edit_mask,
     is_finite_loss,
     load_resume_state,
+    reference_delta_loss_mask,
     save_resume_state,
 )
 
@@ -58,6 +60,107 @@ DEFAULT_PREVIEWS = [
     "a still life of fruit on a wooden table, studio lighting",
     "a lighthouse on a rocky coast under a stormy sky",
 ]
+
+
+_ANNOTATION_FIELDS = frozenset({"reference_delta_mask", "validation_group"})
+_GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _validate_cache_annotation(value, *, source: str) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f"{source}: annotation must be a JSON object")
+    unknown = set(value) - _ANNOTATION_FIELDS
+    if unknown:
+        raise ValueError(f"{source}: unknown annotation fields: {sorted(unknown)}")
+    out = {}
+    if "reference_delta_mask" in value:
+        flag = value["reference_delta_mask"]
+        if not isinstance(flag, bool):
+            raise ValueError(f"{source}: reference_delta_mask must be a JSON boolean")
+        out["reference_delta_mask"] = flag
+    if "validation_group" in value:
+        group = value["validation_group"]
+        if not isinstance(group, str) or not _GROUP_RE.fullmatch(group):
+            raise ValueError(
+                f"{source}: validation_group must match {_GROUP_RE.pattern!r}")
+        out["validation_group"] = group
+    return out
+
+
+def load_cache_annotations(path: str) -> tuple[dict, str]:
+    """Load optional per-cache annotations and return them with a content digest."""
+    if not path:
+        return {}, ""
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"invalid cache annotation JSON in {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top-level cache annotations must be a JSON object")
+    out = {}
+    for key, value in data.items():
+        name = os.path.basename(str(key))
+        if not name:
+            raise ValueError(f"{path}: empty cache filename")
+        if name in out:
+            raise ValueError(f"{path}: duplicate cache filename {name!r}")
+        out[name] = _validate_cache_annotation(value, source=f"{path}:{name}")
+    return out, hashlib.sha256(raw).hexdigest()
+
+
+def cache_annotation(sample: dict, path: str, annotations: dict) -> dict:
+    """Resolve embedded annotations with an optional sidecar override."""
+    embedded = {key: sample[key] for key in _ANNOTATION_FIELDS if key in sample}
+    out = _validate_cache_annotation(embedded, source=os.path.basename(path))
+    override = annotations.get(os.path.basename(path))
+    if override is not None:
+        out.update(override)
+    return out
+
+
+def reference_delta_flags(samples: list[dict], paths, annotations: dict) -> torch.Tensor:
+    """Return one explicit delta-mask eligibility flag per sample."""
+    if len(samples) != len(paths):
+        raise ValueError(
+            f"sample/path length mismatch: {len(samples)} samples, {len(paths)} paths")
+    return torch.tensor([
+        bool(cache_annotation(sample, path, annotations).get("reference_delta_mask", False))
+        for sample, path in zip(samples, paths)
+    ], dtype=torch.bool)
+
+
+def validation_group_paths(paths, annotations: dict, load_fn) -> dict[str, list[str]]:
+    """Group annotated validation paths without deriving labels from filenames."""
+    groups = {}
+    for path in paths:
+        group = cache_annotation(load_fn(path), path, annotations).get("validation_group")
+        if group:
+            groups.setdefault(group, []).append(path)
+    return groups
+
+
+def metric_control_steps(render_steps, *, total_steps, val_every, use_val_loss, has_eval_data):
+    """Combine sparse render/scorer points with frequent deterministic val-loss control points."""
+    out = set(render_steps)
+    if use_val_loss and has_eval_data and val_every:
+        out.update(range(int(val_every), int(total_steps) + 1, int(val_every)))
+    return out
+
+
+def atomic_hardlink(src, dst) -> bool:
+    """Atomically hard-link ``src`` to ``dst``; return False when ``src`` does not exist."""
+    if not src or not os.path.exists(src):
+        return False
+    tmp = dst + ".tmp-link"
+    try:
+        os.remove(tmp)
+    except FileNotFoundError:
+        pass
+    os.link(src, tmp)
+    os.replace(tmp, dst)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +472,8 @@ def main():
     output_dir, ckpt_dir = cfg.paths.output_dir, cfg.paths.ckpt_dir
     home_volume_guard(ckpt_dir)
     os.makedirs(output_dir, exist_ok=True)
+    cache_annotations, cache_annotations_digest = load_cache_annotations(
+        cfg.data.cache_annotations)
 
     train_by_bucket, eval_paths = index_caches(cfg.paths.cache_dir, cfg.data.n_eval_holdout,
                                                train_list=cfg.data.train_list,
@@ -413,8 +518,7 @@ def main():
         encoder = build_encoder(cfg, device, dtype, train=train_te)
         _te_mode = str(o.te_mode).strip().lower()
         if _te_mode not in ("full", "lora"):
-            # Silently falling back to full fine-tuning on a typo would swap the experiment arm
-            # (and the checkpoint size) without any signal.
+            # Reject typos so the selected training mode and checkpoint format stay explicit.
             raise SystemExit(f"optim.te_mode must be 'full' or 'lora', got {o.te_mode!r}")
         if train_te and _te_mode == "lora":
             te_adapters = inject_lora_te(encoder.qwen, lc.te_rank or lc.rank, lc.alpha)
@@ -541,10 +645,10 @@ def main():
                     # opt.param_groups keeps step_parameter on the scheduler-updated group.
                     g = opt.param_groups[gidx]
                     if param.grad is None or not torch.isfinite(param.grad).all():
-                        # A FINITE scalar loss can still produce non-finite bf16 grads for SOME
-                        # parameters. Those are skipped while parameters whose grads arrived
-                        # earlier have ALREADY been updated, so one logical step updates an
-                        # arbitrary subset of the model while the LR scheduler advances normally.
+                        # A finite scalar loss can still produce non-finite bf16 gradients for some
+                        # parameters. The fused update applies gradients as they arrive, so a later
+                        # non-finite gradient can make the logical step partial while the scheduler
+                        # advances normally.
                         # True atomicity is impossible here (the fused backward frees each grad on
                         # arrival, which is what keeps peak memory low), so instead: COUNT it, surface
                         # it in metrics, and abort on a sustained problem rather than drift silently.
@@ -568,31 +672,20 @@ def main():
     tracker = Tracker(lg.tracker, project=lg.wandb_project, run_name=lg.run_name or None,
                       out_dir=output_dir)
 
-    def collate(paths, drop_refs=False):
-        """Build (z0, context, text_mask, grid_h, grid_w, refs, ref_grids, ref_drop) for a grid-homogeneous batch.
+    def collate(paths, drop_refs=False, augment_order=False):
+        """Build the tensors and metadata for a grid-homogeneous batch.
 
         ``drop_refs`` (train batches only): with VLM dual conditioning, reference dropout is decided
         HERE so the text encoding agrees with the latent refs — dropped samples are encoded text-only
         and the mask is returned as ``ref_drop`` for ``edit_training_step``. Validation keeps it off.
+        ``augment_order`` is also train-only. Keeping it explicit prevents validation from consuming
+        the training sampler's Python RNG or measuring a different random reference permutation at
+        every evaluation.
         """
         samples = [load_sample(p, device) for p in paths]
-        # Reference-order augmentation: permute a sample's references AND rewrite its caption's
-        # image_k mentions together, so the ordinal stays truthful while the slot layout varies.
-        if cfg.data.ref_permute_prob > 0.0 and samples[0].get("refs"):
-            for _i, _s in enumerate(samples):
-                _n = len(_s["refs"])
-                if _n < 2 or rng.random() >= cfg.data.ref_permute_prob:
-                    continue
-                _perm = list(range(_n))
-                rng.shuffle(_perm)
-                if _perm == list(range(_n)):
-                    continue
-                _s = dict(_s)                                   # never mutate the cached payload
-                _s["refs"] = [_s["refs"][j] for j in _perm]
-                if _s.get("ref_paths"):
-                    _s["ref_paths"] = [_s["ref_paths"][j] for j in _perm]
-                _s["caption"] = permute_reference_order(_s["caption"], _n, _perm)
-                samples[_i] = _s
+        delta_mask_flags = reference_delta_flags(samples, paths, cache_annotations)
+        samples = augment_reference_order(
+            samples, rng, cfg.data.ref_permute_prob, enabled=augment_order)
         gh, gw = samples[0]["grid_h"], samples[0]["grid_w"]
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)  # (B,n,64)
         ref_drop = None
@@ -642,12 +735,13 @@ def main():
             ref_grids = [(r["grid_h"], r["grid_w"]) for r in samples[0]["refs"]]
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]
-        return z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop
+        return z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags
 
     def sample_batch():
         key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
         files = train_by_bucket[key]
-        return collate([rng.choice(files) for _ in range(o.batch)], drop_refs=True)
+        return collate([rng.choice(files) for _ in range(o.batch)],
+                       drop_refs=True, augment_order=True)
 
     # ----- EMA (CPU fp32 shadow of the trained DiT weights; zero extra VRAM) -----
     ema = None
@@ -675,11 +769,9 @@ def main():
             g.setdefault((int(d["grid_h"]), int(d["grid_w"])), []).append(p)
         return g
 
-    # Split the holdout by capability so a combined val_loss cannot mask one arm regressing while
-    # the other improves. Cache-index convention: single-ref (text-driven edit) < 300000; multi-
-    # reference (reference-driven) >= 300000. Both are reported; the COMBINED value drives the stop.
-    _val_text = [p for p in eval_paths if int(os.path.basename(p)[:6]) < 300000]
-    _val_ref = [p for p in eval_paths if int(os.path.basename(p)[:6]) >= 300000]
+    # Optional labels expose subgroup regressions while the combined value remains the control metric.
+    _val_groups = validation_group_paths(
+        eval_paths, cache_annotations, lambda path: load_sample(path, device))
 
     def run_val(breakdown=None):
         # Put BOTH the DiT and the (live) text encoder in eval mode: val re-encodes captions through
@@ -692,7 +784,7 @@ def main():
             encoder.qwen.eval()
 
         def loss_fn(packed, q):
-            (z0, ctx, mask, gh, gw, refs, ref_grids, _), vsched = packed
+            (z0, ctx, mask, gh, gw, refs, ref_grids, _, _), vsched = packed
             t = float(vsched(torch.tensor([float(q)])).item())
             g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
             if refs is not None:
@@ -707,10 +799,9 @@ def main():
         with torch.no_grad():
             v = compute_val_loss(loss_fn, _val_batches(eval_paths))
             if breakdown is not None:
-                if _val_text:
-                    breakdown["val_loss_text"] = compute_val_loss(loss_fn, _val_batches(_val_text))
-                if _val_ref:
-                    breakdown["val_loss_ref"] = compute_val_loss(loss_fn, _val_batches(_val_ref))
+                for group, group_paths in sorted(_val_groups.items()):
+                    breakdown[f"val_loss_group/{group}"] = compute_val_loss(
+                        loss_fn, _val_batches(group_paths))
         if was_training:
             dit.train()
         if enc_was_training:
@@ -749,13 +840,31 @@ def main():
         ``dit_step*`` glob that ``save_ckpt`` rotates, so recency rotation can never delete it.
         No resume marker is written — a best checkpoint is an artifact, not a resume point.
 
+        When the same step was already written by ``ckpt_every``, create an atomic hard link into
+        the best namespace instead of serializing another model copy. Recency rotation only
+        unlinks the regular name; the protected inode remains alive through the best link.
+
         Pruning happens only AFTER the new set is written, so free space must cover the incoming
-        artifacts on top of the ones still held. Running out mid-write leaves a truncated 'best'
-        and kills a multi-day run, so refuse up front instead."""
-        need = sum(p.numel() * 2 for p in dit.parameters())          # bf16 serialization
-        if train_te and encoder is not None and not te_adapters:
-            need += sum(p.numel() * 2 for p in encoder.qwen.parameters())
+        artifacts on top of the ones still held. Refuse up front when space is insufficient so a
+        partial write cannot leave a truncated best checkpoint."""
+        def paths(prefix, best_prefix):
+            return (os.path.join(ckpt_dir, f"{prefix}_{tag}.safetensors"),
+                    os.path.join(ckpt_dir, f"{best_prefix}_{tag}.safetensors"))
+
+        dit_src, dit_dst = paths("dit", "dit_best")
+        te_src = te_dst = None
+        if train_te and encoder is not None:
+            te_src, te_dst = paths("te_lora" if te_adapters else "te", "te_best")
+        ema_src = ema_dst = None
         if ema is not None:
+            ema_src, ema_dst = paths("dit_ema", "dit_ema_best")
+
+        need = 0
+        if not os.path.exists(dit_src):
+            need += sum(p.numel() * 2 for p in dit.parameters())     # bf16 serialization
+        if te_src and not os.path.exists(te_src) and not te_adapters:
+            need += sum(p.numel() * 2 for p in encoder.qwen.parameters())
+        if ema_src and not os.path.exists(ema_src):
             need += sum(p.numel() * 2 for p in dit.parameters())
         need = int(need * 1.15)                                      # tmp file + slack
         free = shutil.disk_usage(ckpt_dir).free
@@ -764,17 +873,24 @@ def main():
                   f"only {free / 1e9:.1f}GB free on {ckpt_dir}", flush=True)
             raise RuntimeError(f"insufficient disk for best checkpoint ({free / 1e9:.1f}GB free, "
                                f"~{need / 1e9:.1f}GB needed)")
-        save_ckpt(dit, ckpt_dir, tag, 0, keep_last=10 ** 6, prefix="dit_best")
+
+        linked = atomic_hardlink(dit_src, dit_dst)
+        if not linked:
+            save_ckpt(dit, ckpt_dir, tag, 0, keep_last=10 ** 6, prefix="dit_best")
         if train_te and encoder is not None:
-            if te_adapters:
+            if atomic_hardlink(te_src, te_dst):
+                pass
+            elif te_adapters:
                 save_lora(te_adapters, os.path.join(ckpt_dir, f"te_best_{tag}.safetensors"),
                           rank=lc.te_rank or lc.rank, alpha=lc.alpha or (lc.te_rank or lc.rank),
                           key_prefix="text_encoder")
             else:
                 save_ckpt(encoder.qwen, ckpt_dir, tag, 0, keep_last=10 ** 6, prefix="te_best")
         if ema is not None:
-            ema.write_safetensors(os.path.join(ckpt_dir, f"dit_ema_best_{tag}.safetensors"),
-                                  dit.state_dict(), metadata={"ema": "1"})
+            if not atomic_hardlink(ema_src, ema_dst):
+                ema.write_safetensors(ema_dst, dit.state_dict(), metadata={"ema": "1"})
+        if linked:
+            print(f"[eval] best {tag}: reused regular checkpoint via hard link", flush=True)
 
     # ----- Graceful interrupt: save a FULL resumable checkpoint on signal, then exit -----
     _state = {"step": 0}
@@ -836,6 +952,7 @@ def main():
     _man = write_manifest(
         os.path.join(output_dir, "run_manifest.json"), cfg,
         extra={"cache_dir": cfg.paths.cache_dir, "train_list": cfg.data.train_list,
+               "cache_annotations_digest": cache_annotations_digest,
                "n_train": n_train, "n_eval": len(eval_paths), "buckets": [list(b) for b in bucket_keys],
                "steps": steps, "dit_init": f"{cfg.paths.dit_repo}/{cfg.paths.dit_file}",
                "te_init": cfg.paths.te_init})
@@ -846,26 +963,33 @@ def main():
     # ----- Quality-eval schedule + metric-driven retention / early stop -----
     # Log-spaced by default intent: dense early (where the curve moves), sparse late. The scorer is
     # pluggable so this trainer stays task-agnostic; with none set we fall back to val_loss.
+    # ``eval_step_set`` controls expensive qualitative renders / external scorers. When val_loss is
+    # the scorer, every ``val_every`` measurement must also drive best-N and patience so stopping
+    # decisions follow the configured validation cadence.
     eval_step_set = set(parse_eval_steps(lg.eval_steps, steps))
     scorer = load_scorer(lg.eval_scorer)
+    control_step_set = metric_control_steps(
+        eval_step_set, total_steps=steps, val_every=lg.val_every,
+        use_val_loss=(scorer is None), has_eval_data=bool(eval_paths))
     # Direction must follow the metric, not the config default: the val_loss fallback is
     # lower-is-better, so leaving mode='max' would select the WORST checkpoint.
     eval_mode = lg.eval_metric_mode
-    if eval_step_set and scorer is None:
+    if control_step_set and scorer is None:
         if str(eval_mode).lower().startswith("max"):
             print("[eval] no eval_scorer -> falling back to val_loss; forcing "
                   "eval_metric_mode='min' (lower loss is better)", flush=True)
         eval_mode = "min"
-    # Bind the state to this experiment so a reused ckpt_dir can't mix arms/metrics/manifests.
-    # Everything that makes two runs DIFFERENT EXPERIMENTS. Omitting the seed, the data arm, the
-    # system prompt or the conditioning flags would let a reused ckpt_dir silently inherit best /
-    # patience state from a different arm -- the contamination this fingerprint exists to prevent.
+    # Bind retained metrics to all settings that affect comparability. A reused checkpoint
+    # directory must not inherit selection or patience state from an incompatible run.
     _fp = "|".join(str(x) for x in (
-        lg.eval_scorer or "val_loss", eval_mode, lg.eval_steps, lg.eval_criteria, lg.eval_guardrails,
+        lg.eval_scorer or "val_loss", eval_mode, lg.eval_steps, lg.val_every,
+        lg.eval_criteria, lg.eval_guardrails,
         lg.edit_preview_manifest, o.te_mode, cfg.paths.te_init, cfg.data.resolution,
         lg.sample_steps, lg.sample_guidance,
-        cfg.runtime.seed, cfg.data.train_list, cfg.data.text_system_prompt,
-        cfg.data.edit_vlm_cond, cfg.data.ref_dropout_prob, cfg.data.masked_loss,
+        cfg.runtime.seed, cfg.data.train_list, cfg.data.eval_list, cfg.data.text_system_prompt,
+        cache_annotations_digest,
+        cfg.data.edit_vlm_cond, cfg.data.ref_dropout_prob, cfg.data.ref_permute_prob,
+        cfg.data.masked_loss, cfg.data.mask_quantile, cfg.data.mask_bg_weight,
         f"{cfg.paths.dit_repo}/{cfg.paths.dit_file}"))
     _criteria = parse_criteria(lg.eval_criteria) or None
     _guards = parse_guardrails(lg.eval_guardrails)
@@ -879,15 +1003,19 @@ def main():
         _dropped = best.drop_after(start_step)
         if _dropped:
             print(f"[eval] resume: discarded {_dropped} eval entr{'y' if _dropped == 1 else 'ies'} "
-                  f"recorded after step {start_step} (they belong to a future this run no longer has)",
+                  f"recorded after the resumed step {start_step}",
                   flush=True)
-    if eval_step_set:
+    if control_step_set:
         _sched = sorted(eval_step_set)
-        print(f"eval schedule: {len(_sched)} points "
+        print(f"render eval schedule: {len(_sched)} points "
               f"({', '.join(str(s) for s in _sched[:6])}{', …' if len(_sched) > 6 else ''}) "
               f"scorer={lg.eval_scorer or 'val_loss'} mode={eval_mode} "
               f"keep_best={lg.keep_best} patience={o.early_stop_patience}"
               f" min_delta={o.early_stop_min_delta}", flush=True)
+        if scorer is None and lg.val_every and eval_paths:
+            print(f"val_loss checkpoint/early-stop control: every {lg.val_every} steps "
+                  f"({len(control_step_set)} total control points including render evals)",
+                  flush=True)
         if best.stale:
             print("[eval] NOTE: existing best.json was from a different experiment "
                   "(fingerprint/mode mismatch) -> starting best/patience state fresh", flush=True)
@@ -907,19 +1035,18 @@ def main():
 
     for step in range(start_step, steps):
         _state["step"] = step
-        z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop = sample_batch()
+        z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags = sample_batch()
         schedule = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
                                            max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
                                            max_seq_len=fl.max_image_seq_len)
         if refs is not None:
             lmask = None
-            # The edit mask is derived from |ref0 - target|, which localises the edit only when ref0
-            # IS the source being edited -- true for single-reference editing, not for multi-reference
-            # composition where ref0 may be an inserted object. So restrict masked loss to single-ref.
-            if cfg.data.masked_loss and len(refs) == 1 and refs[0].shape[1] == z0.shape[1]:
-                lmask = derive_edit_mask(refs[0], z0, quantile=cfg.data.mask_quantile)
-                if cfg.data.mask_bg_weight:
-                    lmask = lmask + (1.0 - lmask) * cfg.data.mask_bg_weight
+            if (cfg.data.masked_loss and len(refs) == 1
+                    and refs[0].shape[1] == z0.shape[1]):
+                lmask = reference_delta_loss_mask(
+                    refs[0], z0, delta_mask_flags,
+                    quantile=cfg.data.mask_quantile,
+                    background_weight=cfg.data.mask_bg_weight)
             loss = edit_training_step(dit, z0=z0, refs=refs, ref_grids=ref_grids, context=ctx,
                                       text_mask=mask, grid_h=gh, grid_w=gw, schedule=schedule,
                                       flow_cfg=fl, generator=gen, cfg_dropout_prob=o.cfg_dropout_prob,
@@ -1009,27 +1136,15 @@ def main():
             gcnt = 0
             t0 = time.time()
 
-        # Skip this cheap val when the log-spaced eval schedule already covers this step -- that path
-        # runs val too (for the scorer) and now logs the same breakdown, so running both would compute
-        # val twice at the coinciding step.
-        if (lg.val_every and (step + 1) % lg.val_every == 0 and eval_paths
-                and (step + 1) not in eval_step_set):
-            _bd = {}
-            vrec = {"step": step + 1, "val_loss": run_val(breakdown=_bd), **_bd}
-            with open(metrics_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(vrec) + "\n")
-            tracker.log({k: v for k, v in vrec.items() if k != "step"}, vrec["step"])
-            print({k: (round(v, 5) if isinstance(v, float) else v) for k, v in vrec.items()}, flush=True)
-            t0 = time.time()  # don't bill val wall-time to the next step's s/step
-
         if lg.ckpt_every and (step + 1) % lg.ckpt_every == 0 and o.train_dit:
             checkpoint(step + 1)
 
         if lg.sample_every and (step + 1) % lg.sample_every == 0:
             do_preview(f"step{step + 1:06d}")
 
-        # ----- Quality eval on the (log-spaced) schedule -> best-N retention + early stop -----
-        if (step + 1) in eval_step_set:
+        # ----- Metric control -> best-N retention + early stop. Qualitative rendering remains on
+        # the sparse eval schedule; deterministic val_loss control runs at every val_every point. -----
+        if (step + 1) in control_step_set:
             sheet = os.path.join(output_dir, "samples", f"step{step + 1:06d}.png")
             score = None
             # Always re-render: an existing file proves only that the PATH exists, not that it was
@@ -1044,7 +1159,8 @@ def main():
             try:
                 if _enc_was_training:
                     encoder.qwen.eval()
-                do_preview(f"step{step + 1:06d}")
+                if (step + 1) in eval_step_set:
+                    do_preview(f"step{step + 1:06d}")
                 if scorer is not None:
                     score = float(scorer(sheet_path=sheet, examples=edit_examples, step=step + 1))
                 elif eval_paths:
@@ -1110,7 +1226,7 @@ def main():
         print("SMOKE OK", flush=True)
     elif o.train_dit and not stopped_early:
         checkpoint(steps, tag="final")
-    if eval_step_set:
+    if control_step_set:
         print(f"[eval] best: {best.summary()}", flush=True)
     tracker.close()
 

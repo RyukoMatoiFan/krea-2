@@ -75,8 +75,13 @@ def build_manifest(cfg, *, extra=None, root=None):
     import torch
 
     codes = code_hashes(root)
+    data = extra or {}
     digest = hashlib.sha256(
-        json.dumps({"code": codes, "config": _asdict(cfg)}, sort_keys=True).encode()).hexdigest()[:16]
+        json.dumps(
+            {"code": codes, "config": _asdict(cfg), "data": _asdict(data)},
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()[:16]
 
     env = {"python": sys.version.split()[0], "platform": platform.platform(),
            "torch": getattr(torch, "__version__", "?")}
@@ -93,7 +98,7 @@ def build_manifest(cfg, *, extra=None, root=None):
     # Every KREA2_* override, so the manifest shows what the launcher actually asked for.
     man["env_overrides"] = {k: v for k, v in sorted(os.environ.items()) if k.startswith("KREA2_")}
     if extra:
-        man["data"] = extra
+        man["data"] = data
     return man
 
 

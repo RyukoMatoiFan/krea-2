@@ -166,6 +166,45 @@ def derive_edit_mask(
   return (diff >= thr).to(z_ref.dtype)
 
 
+def reference_delta_loss_mask(
+  z_ref: torch.Tensor,
+  z_tgt: torch.Tensor,
+  eligible: torch.Tensor,
+  *,
+  quantile: float = 0.5,
+  background_weight: float = 0.0,
+) -> torch.Tensor | None:
+  """Build per-token weights for samples explicitly annotated for delta masking.
+
+  Ineligible rows receive uniform weights, preserving the ordinary objective when a
+  batch contains more than one supervision policy. ``None`` means no row requested
+  delta masking.
+  """
+  eligible = eligible.to(device=z_ref.device, dtype=torch.bool).flatten()
+  if eligible.numel() != z_ref.shape[0]:
+    raise ValueError(
+      f"eligible has {eligible.numel()} rows, expected batch size {z_ref.shape[0]}"
+    )
+  if not bool(eligible.any()):
+    return None
+  if z_ref.shape != z_tgt.shape:
+    raise ValueError(
+      f"reference and target shapes must match, got {tuple(z_ref.shape)} and {tuple(z_tgt.shape)}"
+    )
+  if not 0.0 <= quantile <= 1.0:
+    raise ValueError(f"quantile must be in [0, 1], got {quantile}")
+  if not 0.0 <= background_weight <= 1.0:
+    raise ValueError(
+      f"background_weight must be in [0, 1], got {background_weight}"
+    )
+  mask = derive_edit_mask(z_ref, z_tgt, quantile=quantile)
+  if mask.dim() == 1:
+    mask = mask.unsqueeze(0)
+  if background_weight:
+    mask = mask + (1.0 - mask) * background_weight
+  return torch.where(eligible[:, None], mask, torch.ones_like(mask))
+
+
 # --------------------------------------------------------------------------- #
 # LR schedulers (warmup + cosine / constant / linear / cosine-restarts).
 # --------------------------------------------------------------------------- #

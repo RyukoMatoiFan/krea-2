@@ -103,11 +103,11 @@ We recommend using the following providers and open source tools for finetuning 
   - [Inference](https://fal.ai/models/fal-ai/krea-2/turbo/lora)
 - [Kohya (musubi tuner)]( https://github.com/kohya-ss/musubi-tuner)
 
-## Training (this fork)
+## Training
 
-A self-contained training stack — **full fine-tune and LoRA** for Krea 2 **RAW** on a single 80 GB GPU. Latents and text are precached, so the loop is encoder-free. Full guide: **[docs/TRAINING.md](docs/TRAINING.md)**.
+A self-contained training stack — **full fine-tune and LoRA** for Krea 2 **RAW** on a single GPU. Latents and text are precached, so the loop is encoder-free. Full guide: **[docs/TRAINING.md](docs/TRAINING.md)**.
 
-- **Full fine-tune** of the 12B DiT on one 80 GB H100 (fused per-parameter backward + on-GPU Adafactor + gradient checkpointing + bf16 stochastic rounding).
+- **Full fine-tune** with fused per-parameter backward, on-device Adafactor, gradient checkpointing, and bf16 stochastic rounding.
 - **LoRA** in ComfyUI/ai-toolkit key format — train on RAW, apply on Turbo.
 - Resume, EMA, held-out validation, aspect bucketing; TensorBoard + a live web dashboard (`dashboard.py`).
 

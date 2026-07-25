@@ -21,6 +21,7 @@ optim:
   lr_scheduler: cosine
   min_lr_ratio: 0.1
 data:
+  cache_annotations: ""     # optional filename-to-annotation JSON sidecar for existing caches
   resolution: 1024
   n_eval_holdout: 4
 flow:

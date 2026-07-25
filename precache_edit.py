@@ -12,11 +12,13 @@ Style transfer uses the same path: ref = a style image, target = an image in tha
 
 Manifest line (path keys relative to --data-root, or absolute):
   {"target": "train/000_tgt.jpg", "refs": ["train/000_ref0.jpg", ...],
-   "caption"|"instruction"|"text": "..."}
+   "caption"|"instruction"|"text": "...",
+   "reference_delta_mask": true, "validation_group": "optional-group"}
 
 Cache payload per example (``<idx:06d>.pt``):
   {"z_tgt": (n_tgt,64) bf16, "grid_h", "grid_w", "idx", "caption", "src",
    "refs": [{"tokens": (n_ref,64) bf16, "grid_h", "grid_w"}, ...], "ref_paths": [abs src path, ...],
+   ["reference_delta_mask": bool], ["validation_group": str],
    ["llm_text": (n_text,12,2560) bf16]}
 """
 from __future__ import annotations
@@ -24,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 
 import torch
 from PIL import Image
@@ -32,6 +35,8 @@ from constants import PATCH_SIZE
 from loading import build_encoder, build_vae
 from precache_t2i import ALIGN, atomic_save, encode_latent, images_to_tensor, patchify, round_to
 from training_config import apply_runtime, dtype_of, load_config
+
+_GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _stat_id(path: str) -> str:
@@ -44,8 +49,18 @@ def _stat_id(path: str) -> str:
         return "missing"
 
 
-def _payload_sig(tgt: str, refs: list, caption: str, res: int, cache_text: bool,
-                 *, system_prompt: str = "", encoder_id: str = "", vae_id: str = "") -> str:
+def _payload_sig(
+    tgt: str,
+    refs: list,
+    caption: str,
+    res: int,
+    cache_text: bool,
+    *,
+    annotations: dict | None = None,
+    system_prompt: str = "",
+    encoder_id: str = "",
+    vae_id: str = "",
+) -> str:
     """Fingerprint of everything a cached payload depends on.
 
     Reference ORDER is significant (each reference occupies its own RoPE frame, so swapping two
@@ -54,8 +69,8 @@ def _payload_sig(tgt: str, refs: list, caption: str, res: int, cache_text: bool,
 
     Includes the PRODUCERS of the payload, not just its inputs: the text encoder identity and system
     prompt (they determine cached text), the VAE identity (it determines every latent), and file
-    size+mtime (an image can be replaced in place). Hashing only path strings would miss exactly the
-    failure this repo already hit -- a system prompt that changed while every path stayed identical.
+    size+mtime (an image can be replaced in place). Hashing only path strings would not detect
+    changes to producer settings when every input path stays identical.
     """
     import hashlib
 
@@ -70,6 +85,9 @@ def _payload_sig(tgt: str, refs: list, caption: str, res: int, cache_text: bool,
     h.update((caption or "").encode("utf-8"))
     h.update(f"|res={int(res)}|text={bool(cache_text)}".encode("utf-8"))
     h.update(f"|sys={system_prompt}|enc={encoder_id}|vae={vae_id}".encode("utf-8"))
+    if annotations:
+        h.update(b"|annotations=")
+        h.update(json.dumps(annotations, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     return h.hexdigest()[:32]
 
 
@@ -88,6 +106,22 @@ def _refs_of(line: dict) -> list:
         if line.get(k):
             return [line[k]]
     return []
+
+
+def _annotations_of(line: dict) -> dict:
+    """Validate and copy optional trainer annotations from a manifest row."""
+    out = {}
+    if "reference_delta_mask" in line:
+        value = line["reference_delta_mask"]
+        if not isinstance(value, bool):
+            raise ValueError("reference_delta_mask must be a JSON boolean")
+        out["reference_delta_mask"] = value
+    if "validation_group" in line:
+        value = line["validation_group"]
+        if not isinstance(value, str) or not _GROUP_RE.fullmatch(value):
+            raise ValueError(f"validation_group must match {_GROUP_RE.pattern!r}")
+        out["validation_group"] = value
+    return out
 
 
 def _encode_image(vae, path: str, res: int, device, dtype):
@@ -146,10 +180,17 @@ def main() -> None:
             continue
         tgt = resolve(line["target"])
         caption = _caption(line)
+        try:
+            annotations = _annotations_of(line)
+        except ValueError as e:
+            print(f"  WARN idx={idx}: {e}; skipping", flush=True)
+            skipped += 1
+            continue
         # The payload depends on the target, the ORDERED references, the caption and the
         # resolution -- validating only the target path lets a changed reference order, an added
         # reference, an edited instruction or a different resolution silently reuse a stale cache.
         sig = _payload_sig(tgt, refs, caption, res, args.cache_text,
+                           annotations=annotations,
                            system_prompt=getattr(cfg.data, "text_system_prompt", ""),
                            encoder_id=cfg.paths.text_encoder_id, vae_id=cfg.paths.vae_id)
         out = os.path.join(cache_dir, f"{idx:06d}.pt")
@@ -182,6 +223,7 @@ def main() -> None:
                    "caption": caption, "src": os.path.abspath(tgt), "refs": ref_payload,
                    "ref_paths": [os.path.abspath(r) for r in refs],  # source pixels for optional VLM cond
                    "sig": sig}  # fingerprint of everything the payload depends on (see the skip check)
+        payload.update(annotations)
         if args.cache_text:
             hiddens, mask = encoder([caption])
             payload["llm_text"] = hiddens[0][mask[0]].to(torch.bfloat16).cpu()

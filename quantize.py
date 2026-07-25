@@ -1,6 +1,6 @@
-"""fp8 quantization of the frozen LoRA base, to roughly halve resident weight VRAM.
+"""FP8 quantization of the frozen LoRA base to reduce resident weight memory.
 
-For a LoRA fine-tune the 12B DiT base is frozen — only the adapters train — so its weights can be
+For a LoRA fine-tune the DiT base is frozen — only the adapters train — so its weights can be
 stored in 8-bit (e4m3) and dequantized on the fly in the forward. ``quantize_dit_fp8`` replaces the
 transformer blocks' ``nn.Linear`` (the attention + MLP bulk) with :class:`Fp8Linear`; the small
 input/output/text-fusion stages stay bf16 (sensitive, negligible VRAM).

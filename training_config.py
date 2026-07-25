@@ -97,6 +97,7 @@ class DataConfig:
   vlm_image_size: int = 384        # max source-image side for the VLM conditioning path
   train_list: str = ""             # JSON list of cache filenames (repeats = oversampling)
   eval_list: str = ""              # JSON list of held-out cache filenames (else idx < n_eval_holdout)
+  cache_annotations: str = ""      # optional JSON map: filename -> neutral training annotations
   aspect_bucketing: bool = False   # precache at nearest-AR bucket instead of square-squash
   bucket_pixels: int = 0           # target area for buckets; 0 -> resolution^2
   num_buckets: int = 9
@@ -129,7 +130,7 @@ class OptimConfig:
   weight_decay: float = 0.01       # full-FT AdamW weight decay
   te_lr: float = 0.0               # joint full-FT: separate (lower) LR for the text encoder;
                                    # 0 -> lr/10 when training the DiT too, else lr (TE-only stage)
-                                   # (te_lr = 0 also means "TE frozen" -- the third TE arm)
+                                   # te_lr = 0 keeps the text encoder frozen
   te_mode: str = "full"            # how the TE trains when te_lr>0: full = fine-tune all Qwen3-VL
                                    # weights | lora = frozen base + TE-LoRA adapters (lora.te_rank).
                                    # 'lora' is the safer default on a narrow single-domain corpus,

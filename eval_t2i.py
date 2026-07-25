@@ -120,7 +120,7 @@ def main():
     print(f"generating BASE: {len(prompts)} prompts", flush=True)
     base_imgs = gen(dit, vae, encoder, prompts, args)
 
-    # VARIANT column: mutate the same dit in place (no second 12B model resident).
+    # VARIANT column: mutate the same DiT in place to avoid a second resident model copy.
     var_imgs, var_label = None, None
     if args.lora:
         load_lora(dit, args.lora)

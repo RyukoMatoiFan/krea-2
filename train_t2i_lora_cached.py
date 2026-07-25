@@ -21,13 +21,16 @@ import torch
 from loading import build_dit, build_encoder, build_vae
 from lora import inject_lora, inject_lora_te, load_lora_weights, lora_parameters, save_lora
 from scheduler import get_schedule_for_seqlen
-from train_t2i import edit_training_step, encode_text_with_ref_dropout, t2i_training_step, permute_reference_order
+from train_t2i import (augment_reference_order, edit_training_step,
+                        encode_text_with_ref_dropout, t2i_training_step)
 from train_t2i_full_joint_cached import (
     DEFAULT_PREVIEWS,
     home_volume_guard,
     index_caches,
+    load_cache_annotations,
     load_sample,
     preload_all,
+    reference_delta_flags,
     render_edit_previews,
     render_previews,
     resolve_resume_marker,
@@ -41,9 +44,9 @@ from training_utils import (
     build_lr_scheduler,
     build_optimizer,
     compute_val_loss,
-    derive_edit_mask,
     is_finite_loss,
     load_resume_state,
+    reference_delta_loss_mask,
     save_resume_state,
 )
 
@@ -65,8 +68,10 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    train_by_bucket, eval_paths = index_caches(cfg.paths.cache_dir, cfg.data.n_eval_holdout,
-                                               train_list=cfg.data.train_list)
+    cache_annotations, _ = load_cache_annotations(cfg.data.cache_annotations)
+    train_by_bucket, eval_paths = index_caches(
+        cfg.paths.cache_dir, cfg.data.n_eval_holdout,
+        train_list=cfg.data.train_list, eval_list=cfg.data.eval_list)
     bucket_keys = list(train_by_bucket)
     bucket_weights = [len(train_by_bucket[k]) for k in bucket_keys]
     if o.preload_caches:
@@ -152,28 +157,14 @@ def main():
     metrics_path = os.path.join(output_dir, "metrics.jsonl")
     tracker = Tracker(lg.tracker, project=lg.wandb_project, run_name=lg.run_name or None, out_dir=output_dir)
 
-    def collate(paths, drop_refs=False):
+    def collate(paths, drop_refs=False, augment_order=False):
         # drop_refs (train batches only): with VLM dual conditioning, reference dropout is decided here
         # so the text encoding agrees with the latent refs — dropped samples are encoded text-only and
         # the mask travels to edit_training_step as ref_drop. Validation keeps it off.
         samples = [load_sample(p, device) for p in paths]
-        # Reference-order augmentation: permute a sample's references AND rewrite its caption's
-        # image_k mentions together, so the ordinal stays truthful while the slot layout varies.
-        if cfg.data.ref_permute_prob > 0.0 and samples[0].get("refs"):
-            for _i, _s in enumerate(samples):
-                _n = len(_s["refs"])
-                if _n < 2 or rng.random() >= cfg.data.ref_permute_prob:
-                    continue
-                _perm = list(range(_n))
-                rng.shuffle(_perm)
-                if _perm == list(range(_n)):
-                    continue
-                _s = dict(_s)                                   # never mutate the cached payload
-                _s["refs"] = [_s["refs"][j] for j in _perm]
-                if _s.get("ref_paths"):
-                    _s["ref_paths"] = [_s["ref_paths"][j] for j in _perm]
-                _s["caption"] = permute_reference_order(_s["caption"], _n, _perm)
-                samples[_i] = _s
+        delta_mask_flags = reference_delta_flags(samples, paths, cache_annotations)
+        samples = augment_reference_order(
+            samples, rng, cfg.data.ref_permute_prob, enabled=augment_order)
         gh, gw = samples[0]["grid_h"], samples[0]["grid_w"]
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)
         ref_drop = None
@@ -219,12 +210,13 @@ def main():
             ref_grids = [(r["grid_h"], r["grid_w"]) for r in samples[0]["refs"]]
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]
-        return z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop
+        return z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags
 
     def sample_batch():
         key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
         files = train_by_bucket[key]
-        return collate([rng.choice(files) for _ in range(o.batch)], drop_refs=True)
+        return collate([rng.choice(files) for _ in range(o.batch)],
+                       drop_refs=True, augment_order=True)
 
     # ----- EMA over the adapter tensors (cheap: only the LoRA params) -----
     ema = None
@@ -257,7 +249,7 @@ def main():
                     batches.append(((collate(chunk), vsched), len(chunk)))
 
             def loss_fn(packed, q):
-                (z0, ctx, mask, gh, gw, refs, ref_grids, _), vsched = packed
+                (z0, ctx, mask, gh, gw, refs, ref_grids, _, _), vsched = packed
                 t = float(vsched(torch.tensor([float(q)])).item())
                 g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
                 if refs is not None:
@@ -349,16 +341,18 @@ def main():
     n_skipped = 0
     for step in range(start_step, steps):
         _state["step"] = step
-        z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop = sample_batch()
+        z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags = sample_batch()
         schedule = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
                                            max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
                                            max_seq_len=fl.max_image_seq_len)
         if refs is not None:
             lmask = None
-            if cfg.data.masked_loss and refs[0].shape[1] == z0.shape[1]:
-                lmask = derive_edit_mask(refs[0], z0, quantile=cfg.data.mask_quantile)
-                if cfg.data.mask_bg_weight:
-                    lmask = lmask + (1.0 - lmask) * cfg.data.mask_bg_weight
+            if (cfg.data.masked_loss and len(refs) == 1
+                    and refs[0].shape[1] == z0.shape[1]):
+                lmask = reference_delta_loss_mask(
+                    refs[0], z0, delta_mask_flags,
+                    quantile=cfg.data.mask_quantile,
+                    background_weight=cfg.data.mask_bg_weight)
             loss = edit_training_step(dit, z0=z0, refs=refs, ref_grids=ref_grids, context=ctx,
                                       text_mask=mask, grid_h=gh, grid_w=gw, schedule=schedule,
                                       flow_cfg=fl, generator=gen, cfg_dropout_prob=o.cfg_dropout_prob,
