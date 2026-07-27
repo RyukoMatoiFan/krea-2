@@ -500,6 +500,8 @@ def main():
 
     dit = build_dit(cfg, device, dtype, load_weights=True, train=o.train_dit)
     dit.gradient_checkpointing = o.grad_checkpointing
+    dit.pad_to_multiple = cfg.data.pad_to_multiple
+    dit.skip_ref_cross_attention = cfg.data.skip_ref_cross_attention
     if not o.train_dit:
         dit.eval().requires_grad_(False)
     if o.blocks_to_swap:
@@ -608,7 +610,12 @@ def main():
         raise SystemExit("nothing to train (train_dit=False and train_te=False)")
 
     if o.optimizer_state == "adafactor":
-        opt = build_fused_adafactor(groups, lr=o.lr, weight_decay=o.weight_decay)
+        if o.adafactor_kernel == "triton":
+            from adafactor_triton import build_triton_adafactor
+
+            opt = build_triton_adafactor(groups, lr=o.lr, weight_decay=o.weight_decay)
+        else:
+            opt = build_fused_adafactor(groups, lr=o.lr, weight_decay=o.weight_decay)
     else:
         opt = build_fused_adamw(groups, lr=o.lr, weight_decay=o.weight_decay,
                                 offload_states=o.offload_optimizer)

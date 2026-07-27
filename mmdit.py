@@ -1,3 +1,4 @@
+import functools
 import math
 from dataclasses import dataclass
 
@@ -38,16 +39,65 @@ def attention(
     scale: float | None = None,
     gqa: bool = False,
 ) -> Tensor:
-    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-        x = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
-        )
+    if _is_block_mask(mask):
+        # Block-sparse path: the kernel SKIPS whole blocks instead of computing and discarding
+        # them, which a dense boolean mask cannot do. This is how reference<->reference attention
+        # is dropped.
+        x = _flex(q, k, v, block_mask=mask, scale=scale, enable_gqa=gqa)
+    else:
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
+            )
     return rearrange(x, "B H L D -> B L (H D)")
 
 
 def _mask(mask: Tensor) -> Tensor:
     """Expand a (B, L) key-padding mask into a (B, 1, L, L) attention mask."""
     return mask.unsqueeze(1).unsqueeze(2) * mask.unsqueeze(1).unsqueeze(3)
+
+
+def _is_block_mask(mask) -> bool:
+    """True for a FlexAttention ``BlockMask`` (as opposed to a dense bool tensor or None)."""
+    return mask is not None and not isinstance(mask, Tensor)
+
+
+@functools.lru_cache(maxsize=8)
+def _compiled_flex():
+    from torch.nn.attention.flex_attention import flex_attention
+
+    return torch.compile(flex_attention, dynamic=False)
+
+
+def _flex(q, k, v, *, block_mask, scale, enable_gqa):
+    return _compiled_flex()(q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa)
+
+
+def ref_block_mask(txt_len: int, ref_lens: list[int], tgt_len: int, total: int, device):
+    """Block mask that drops attention BETWEEN DIFFERENT references.
+
+    Sequence layout is ``[text | ref_0 .. ref_{n-1} | target]``. Each reference is a coherent image
+    and may attend within itself, to the text and to the target; the target and text attend to
+    everything. What is dropped is one reference attending to a *different* reference, which carries
+    no meaning -- references are independent conditioning -- and which grows to dominate the
+    attention matrix as references are added.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    # Segment id per position: 0 = text, 1 = target (and padding, which the key mask handles),
+    # 2 + i = reference i.
+    seg = torch.ones(total, dtype=torch.int32, device=device)
+    seg[:txt_len] = 0
+    pos = txt_len
+    for i, rl in enumerate(ref_lens):
+        seg[pos: pos + rl] = 2 + i
+        pos += rl
+
+    def mask_mod(b, h, qi, ki):
+        sq, sk = seg[qi], seg[ki]
+        return (~((sq >= 2) & (sk >= 2))) | (sq == sk)
+
+    return create_block_mask(mask_mod, B=None, H=None, Q_LEN=total, KV_LEN=total, device=device)
 
 
 def temb(
@@ -323,6 +373,11 @@ class SingleStreamDiT(nn.Module):
     def __init__(self, config: SingleMMDiTConfig):
         super().__init__()
         self.config = config
+        # Attention-cost switches, both opt-in so the default path stays byte-identical.
+        # ``pad_to_multiple = 0`` drops the sequence padding (and with it the key-padding mask);
+        # ``skip_ref_cross_attention`` routes multi-reference batches through a block-sparse mask.
+        self.pad_to_multiple = 256
+        self.skip_ref_cross_attention = False
 
         headdim = config.features // config.heads
         axes = [
@@ -437,6 +492,7 @@ class SingleStreamDiT(nn.Module):
         attn_mask_override: Tensor | None = None,
         txt_attn_override: Tensor | None = None,
         ref_len: int = 0,
+        ref_lens: list[int] | None = None,
     ) -> Tensor:
         # ``attn_mask_override`` / ``txt_attn_override`` are OPT-IN regional-attention masks
         # (bool, (B,1,L,L) / (B,1,txtlen,txtlen)) ANDed onto the default key-padding mask to route
@@ -462,19 +518,33 @@ class SingleStreamDiT(nn.Module):
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
 
-        # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
+        # Pad the combined sequence to a multiple of ``pad_to_multiple`` to stabilize compiled
+        # kernel shapes. Set it to 0 to disable: the padding forces a key-padding mask to exist,
+        # and a dense (B,1,L,L) mask is costly at long sequences, so with a single sample per step
+        # (where the text needs no padding either) dropping both lets attention run unmasked.
         fulllen = combined.shape[1]
-        _padlen = (-fulllen) % 256
+        _padlen = (-fulllen) % self.pad_to_multiple if self.pad_to_multiple else 0
         if _padlen > 0:
             combined = F.pad(combined, (0, 0, 0, _padlen))
             mask = F.pad(mask, (0, _padlen), value=False)
             pos = F.pad(pos, (0, 0, 0, _padlen))
 
-        mask = _mask(mask)
-        if attn_mask_override is not None:
-            if _padlen > 0:
-                attn_mask_override = F.pad(attn_mask_override, (0, _padlen, 0, _padlen), value=False)
-            mask = mask & attn_mask_override
+        # An all-true mask carries no information; passing None instead lets the attention kernel
+        # take its unmasked path. ``.all()`` costs one host sync per forward, negligible next to
+        # the mask it avoids materialising.
+        informative = attn_mask_override is not None or not bool(mask.all())
+        if not informative and self.skip_ref_cross_attention and ref_len and ref_lens:
+            mask = ref_block_mask(txtlen, ref_lens, imglen - ref_len,
+                                  combined.shape[1], combined.device)
+        elif not informative:
+            mask = None
+        else:
+            mask = _mask(mask)
+            if attn_mask_override is not None:
+                if _padlen > 0:
+                    attn_mask_override = F.pad(attn_mask_override, (0, _padlen, 0, _padlen),
+                                               value=False)
+                mask = mask & attn_mask_override
 
         freqs = self.posemb(pos)
 

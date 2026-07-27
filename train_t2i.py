@@ -301,8 +301,10 @@ def edit_training_step(
 
     # Number of leading (clean) reference image tokens -> the DiT gives them t=0 modulation when ref_t0.
     ref_len = sum(int(r.shape[1]) for r in ref_tokens) if ref_t0 else 0
+    # Per-reference lengths let the DiT build a block mask that drops reference<->reference
+    # attention; it is ignored unless that path is enabled.
     out = dit(img=img.to(dit_dtype(dit)), context=ctx.to(dit_dtype(dit)), t=t, pos=pos, mask=mask,
-              ref_len=ref_len)
+              ref_len=ref_len, ref_lens=[int(r.shape[1]) for r in ref_tokens])
     pred_tgt = out[:, -n_tgt:].float()  # supervise only the trailing target tokens
     weight = None if disable_weighting else timestep_weight(
         t, flow_cfg.timestep_weighting, gamma=flow_cfg.min_snr_gamma)

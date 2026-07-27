@@ -84,6 +84,14 @@ class DataConfig:
   n_eval_holdout: int = 4
   prebuilt_json: bool = False      # read a verbatim JSON caption sidecar per image
   json_suffix: str = ".json"
+  pad_to_multiple: int = 256       # pad the DiT sequence to this multiple (0 = off). The padding
+                                   # forces a key-padding mask to exist, and a dense (B,1,L,L) mask
+                                   # is costly at long sequences; with a single sample per step the
+                                   # text needs no padding either, so attention can run unmasked.
+  skip_ref_cross_attention: bool = False  # (multi-reference) drop attention BETWEEN DIFFERENT
+                                   # references via a block-sparse mask. References are independent
+                                   # conditioning, so those blocks carry no meaning; skipping them
+                                   # is exact, not an approximation.
   masked_loss: bool = False        # (edit) weight loss to the edited region
   mask_quantile: float = 0.5
   mask_bg_weight: float = 0.0
@@ -116,6 +124,10 @@ class OptimConfig:
                              # norm can be formed. Each tensor is bounded by this value, but the
                              # aggregate model norm can reach ~sqrt(n_tensors) * grad_clip.
   grad_checkpointing: bool = True
+  adafactor_kernel: str = "eager"  # eager | triton -- the fused per-parameter Adafactor update.
+                                   # "triton" computes the same math without materialising the
+                                   # fp32 gradient copy or the update tensor, so the update stops
+                                   # being bound by memory traffic.
   cfg_dropout_prob: float = 0.1
   use_ema: bool = False            # maintain an EMA of the trained weights (LoRA adapter or full DiT)
   ema_decay: float = 0.999
