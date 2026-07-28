@@ -75,7 +75,7 @@ def quantize_int8_rows(x: torch.Tensor, qmax: int = ACT_QMAX):
     return q, scales
 
 
-def _act_quant_padded(x: torch.Tensor, qmax: int):
+def _act_quant_padded_torch(x: torch.Tensor, qmax: int):
     """Per-token activation quantization, rows padded to a multiple of 32 for ``torch._int_mm``."""
     q, scales = quantize_int8_rows(x, qmax)
     rows = q.shape[0]
@@ -86,13 +86,124 @@ def _act_quant_padded(x: torch.Tensor, qmax: int):
     return q, scales
 
 
-def _epilogue(i32, a_scales, w_scales, bias, out_dtype: torch.dtype) -> torch.Tensor:
+def _epilogue_torch(i32, a_scales, w_scales, bias, out_dtype: torch.dtype) -> torch.Tensor:
     """``out = i32 * a_scales[:, None] * w_scales[None, :] (+ bias)``, accumulated in fp32."""
     out = i32.float() * w_scales
     out = out * a_scales.unsqueeze(1)
     if bias is not None:
         out = out + bias.float()
     return out.to(out_dtype)
+
+
+# --------------------------------------------------------------------------- #
+# Fused kernels for the two stages around the matmul. Expressed as eager elementwise ops, each
+# stage walks a full-size tensor several times in fp32; one kernel per side collapses that into a
+# single pass. Both fall back to the torch implementations above when Triton is unavailable.
+# --------------------------------------------------------------------------- #
+_triton_ok: bool | None = None
+
+
+def _have_triton() -> bool:
+    global _triton_ok
+    if _triton_ok is None:
+        try:
+            import triton  # noqa: F401
+            import triton.language  # noqa: F401
+
+            _triton_ok = True
+        except Exception:
+            _triton_ok = False
+    return _triton_ok
+
+
+def _build_kernels():
+    import triton
+    import triton.language as tl
+
+    try:
+        from triton.language.extra import libdevice
+
+        _round = libdevice.rint          # half-to-even, matching torch.round
+    except Exception:                     # older Triton: floor(x + 0.5) away from zero
+        def _round(v):
+            return tl.where(v >= 0, tl.floor(v + 0.5), tl.ceil(v - 0.5))
+
+    @triton.jit
+    def act_quant(x_ptr, q_ptr, s_ptr, M, K, QMAX: tl.constexpr, BLOCK_K: tl.constexpr):
+        """Row amax -> scale -> int8 codes in one launch. Rows past ``M`` are the padding
+        ``torch._int_mm`` needs and are written as zeros with a unit scale."""
+        row = tl.program_id(0)
+        if row >= M:
+            for k0 in range(0, K, BLOCK_K):
+                offs = k0 + tl.arange(0, BLOCK_K)
+                tl.store(q_ptr + row * K + offs, tl.zeros((BLOCK_K,), tl.int8), mask=offs < K)
+            tl.store(s_ptr + row, 1.0)
+        else:
+            amax = tl.zeros((BLOCK_K,), tl.float32)
+            for k0 in range(0, K, BLOCK_K):
+                offs = k0 + tl.arange(0, BLOCK_K)
+                x = tl.load(x_ptr + row * K + offs, mask=offs < K, other=0.0).to(tl.float32)
+                amax = tl.maximum(amax, tl.abs(x))
+            s = tl.max(amax) / QMAX
+            s = tl.where(s > 0, s, 1.0)
+            tl.store(s_ptr + row, s)
+            for k0 in range(0, K, BLOCK_K):
+                offs = k0 + tl.arange(0, BLOCK_K)
+                x = tl.load(x_ptr + row * K + offs, mask=offs < K, other=0.0).to(tl.float32)
+                q = _round(x / s)
+                q = tl.minimum(tl.maximum(q, -QMAX), QMAX)
+                tl.store(q_ptr + row * K + offs, q.to(tl.int8), mask=offs < K)
+
+    @triton.jit
+    def epilogue(i32_ptr, a_ptr, w_ptr, b_ptr, out_ptr, N,
+                 HAS_BIAS: tl.constexpr, BLOCK_N: tl.constexpr):
+        """``out = i32 * a_scale[row] * w_scale[col] (+ bias)``, one pass, written in out dtype."""
+        row, blk = tl.program_id(0), tl.program_id(1)
+        offs = blk * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offs < N
+        acc = tl.load(i32_ptr + row * N + offs, mask=mask, other=0).to(tl.float32)
+        acc = acc * tl.load(a_ptr + row) * tl.load(w_ptr + offs, mask=mask, other=0.0)
+        if HAS_BIAS:
+            acc = acc + tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * N + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+    return act_quant, epilogue
+
+
+_kernels = None
+
+
+def _get_kernels():
+    global _kernels
+    if _kernels is None:
+        _kernels = _build_kernels()
+    return _kernels
+
+
+def _act_quant_padded(x: torch.Tensor, qmax: int):
+    if not (_have_triton() and x.is_cuda):
+        return _act_quant_padded_torch(x, qmax)
+    m, k = x.shape
+    m_pad = -(-m // 32) * 32
+    q = torch.empty(m_pad, k, device=x.device, dtype=torch.int8)
+    s = torch.empty(m_pad, device=x.device, dtype=torch.float32)
+    act_quant, _ = _get_kernels()
+    act_quant[(m_pad,)](x, q, s, m, k, QMAX=qmax, BLOCK_K=1024, num_warps=8)
+    return q, s
+
+
+def _epilogue(i32, a_scales, w_scales, bias, out_dtype: torch.dtype) -> torch.Tensor:
+    if not (_have_triton() and i32.is_cuda):
+        return _epilogue_torch(i32, a_scales, w_scales, bias, out_dtype)
+    import triton
+
+    m, n = i32.shape
+    out = torch.empty(m, n, device=i32.device, dtype=out_dtype)
+    _, epilogue = _get_kernels()
+    epilogue[(m, triton.cdiv(n, 1024))](i32, a_scales, w_scales,
+                                        bias if bias is not None else a_scales, out, n,
+                                        HAS_BIAS=bias is not None, BLOCK_N=1024, num_warps=4)
+    return out
 
 
 # The forward VALUE is the real int8 tensor-core gemm; the gradient is the straight-through estimate
