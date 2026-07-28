@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Precompute the per-image training cache for Krea 2 text-to-image fine-tuning.
 
-Loads ONLY the encoders (AutoencoderKLQwenImage VAE + frozen Qwen3-VL-4B), NOT the 12B DiT, then for
+Loads ONLY the encoders (AutoencoderKLQwenImage VAE + frozen Qwen3-VL-4B), never the DiT, then for
 each image writes one ``<idx:06d>.pt`` holding the normalized, patchified latent tokens + the caption
 (+ optionally the cached text features). Training is then encoder-free (the joint trainer re-encodes
 captions live through the trainable TE; the DiT-only trainer reuses the cached ``llm_text``).

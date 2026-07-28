@@ -11,7 +11,7 @@ contact sheet: one row per prompt, columns [BASE | VARIANT].
       --ckpt runs/my-run/ckpts/dit_final.safetensors --prompts prompts.txt
   python eval_t2i.py --config config/t2i_full.yaml --out base_sanity.png   # base-only sheet
 
-VRAM note: only ONE 12B DiT is resident at a time -- we generate all BASE images first,
+Only ONE DiT is resident at a time -- we generate all BASE images first,
 then mutate the SAME dit in place (inject the LoRA, or load the ckpt state dict over it)
 and regenerate. The encoder + VAE are built once and reused.
 """

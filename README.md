@@ -108,7 +108,8 @@ We recommend using the following providers and open source tools for finetuning 
 A self-contained training stack — **full fine-tune and LoRA** for Krea 2 **RAW** on a single GPU. Latents and text are precached, so the loop is encoder-free. Full guide: **[docs/TRAINING.md](docs/TRAINING.md)**.
 
 - **Full fine-tune** with fused per-parameter backward, on-device Adafactor, gradient checkpointing, and bf16 stochastic rounding.
-- **LoRA** in ComfyUI/ai-toolkit key format — train on RAW, apply on Turbo.
+- **LoRA** in ComfyUI key format — train on RAW, apply on Turbo. Six adapter parameterisations
+  (`lora`, `dora`, `loha`, `lokr`, `oft`, `boft`), over an optional fp8- or int8-quantized frozen base.
 - Resume, EMA, held-out validation, aspect bucketing; TensorBoard + a live web dashboard (`dashboard.py`).
 
 ```bash

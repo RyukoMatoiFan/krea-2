@@ -86,17 +86,30 @@ def main():
           f"te_lora={train_te} train_dit={lc.train_transformer}", flush=True)
 
     dit = build_dit(cfg, device, dtype, load_weights=True, train=False)
-    fp8_base = o.quantize_base == "fp8" and lc.train_transformer
+    quant = o.quantize_base if lc.train_transformer else ""
+    fp8_base = quant == "fp8"
     if fp8_base:
         from quantize import quantize_dit_fp8   # quantise the frozen base to e4m3 to lower its memory
         nq = quantize_dit_fp8(dit)
         print(f"fp8-quantized {nq} frozen base Linears (attn+mlp)", flush=True)
+    elif quant == "int8":
+        from convrot_int8 import int8_gemm_supported, quantize_dit_int8
+
+        if not int8_gemm_supported(device):
+            raise SystemExit("quantize_base=int8 needs int8 tensor cores (Ampere or newer)")
+        nq = quantize_dit_int8(dit)
+        print(f"int8-quantized {nq} frozen base Linears (attn+mlp)", flush=True)
+    elif quant:
+        raise SystemExit(f"unknown optim.quantize_base {quant!r}; expected '', 'fp8' or 'int8'")
     adapters = inject_lora(dit, lc.rank, lc.alpha,
                            include_txtfusion=lc.target_txtfusion,
-                           include_txtmlp=lc.target_txtmlp) \
+                           include_txtmlp=lc.target_txtmlp,
+                           variant=lc.variant) \
         if lc.train_transformer else {}          # train_transformer=False -> TE-only (DiT frozen)
     # fp8 requires gradient checkpointing: otherwise the per-forward dequant is retained for backward
-    # across every layer, erasing the memory saving. Force it on when fp8 is active.
+    # across every layer, erasing the memory saving. Force it on when fp8 is active. int8 does not
+    # need it -- its backward re-derives the weight from the stored codes and never holds a
+    # dequantized copy.
     if fp8_base and not o.grad_checkpointing:
         print("note: enabling gradient checkpointing (required by the fp8 base)", flush=True)
     dit.gradient_checkpointing = o.grad_checkpointing or fp8_base

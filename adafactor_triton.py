@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """Triton-fused Adafactor update for the fused-backward hook.
 
-The update is memory-traffic bound: the eager path materialises an fp32 copy of the gradient, then
-``upd_sq``, then ``upd``, then an fp32 copy of the parameter, plus an int32 randomness buffer for
-stochastic rounding -- each of them the size of the parameter itself.
+The update is memory-traffic bound: a straightforward implementation materialises a chain of
+intermediates -- an fp32 copy of the gradient, the squared update, the update itself, an fp32 copy of
+the parameter and a randomness buffer for stochastic rounding -- each the size of the parameter.
 
 This version never materialises anything of parameter size. ``upd`` is recomputed from ``g`` instead
 of being stored, trading a cheap re-read for three large writes:

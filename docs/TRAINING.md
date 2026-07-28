@@ -41,14 +41,21 @@ adafactor`) + gradient checkpointing + bf16 stochastic rounding. `--smoke` runs 
 preview then exits (`SMOKE OK`). DiT-only when caches hold `llm_text` and `te_lr: 0`; set `te_lr`
 (e.g. `1e-6`) to jointly fine-tune the text encoder.
 
+Throughput switches, all off by default and none changing the objective:
+
+| option | effect |
+|---|---|
+| `optim.adafactor_kernel: triton` | same update without materialising the fp32 gradient copy or the update tensor |
+| `data.pad_to_multiple: 0` | no sequence padding; with one sample per step the mask is empty and attention runs unmasked |
+| `data.skip_ref_cross_attention: true` | multi-reference only: block-sparse mask dropping attention between *different* references (exact — those blocks carry no meaning) |
+
 Flow-matching convention (see `constants.py`): **t=1 noise, t=0 data**, `x_t = t·noise + (1-t)·x0`,
 velocity target `v = noise - x0`. Timesteps use Krea's resolution-aware `mu` shift (`scheduler.py`).
 
-For reference-conditioned datasets, cache behavior is declared explicitly rather than inferred from
-filenames. Manifest rows accepted by `precache_edit.py` may set `reference_delta_mask: true` when
-the first reference is spatially aligned with the target and should define a delta-based loss mask.
-They may also set a neutral `validation_group` label for subgroup metrics. Existing caches can use
-`data.cache_annotations`, a JSON object keyed by cache filename with the same optional fields:
+Reference-conditioned cache behaviour is declared, never inferred from filenames. `precache_edit.py`
+manifest rows accept two optional fields: `reference_delta_mask: true` (first reference is spatially
+aligned with the target → delta-based loss mask) and `validation_group` (subgroup metrics label).
+Existing caches supply the same fields through `data.cache_annotations`, keyed by cache filename:
 
 ```json
 {
@@ -65,10 +72,26 @@ They may also set a neutral `validation_group` label for subgroup metrics. Exist
 CUDA_VISIBLE_DEVICES=0 python train_t2i_lora_cached.py --config config/t2i_lora.yaml [--smoke]
 ```
 Base DiT frozen bf16; only the injected adapters train (`lora.py`, standard AdamW). Adapters save in
-ai-toolkit/ComfyUI key format (`diffusion_model.<path>.lora_{A,B}.weight`) so a LoRA trained on Raw
+the ComfyUI key format (`diffusion_model.<path>.lora_{A,B}.weight`) so a LoRA trained on Raw
 loads on Turbo. Tune `lora.rank` / `lora.alpha`; `lora.target_txtfusion` and `lora.target_txtmlp`
 default on to adapt the text-fusion and text-MLP stages. Targets the attention `wq/wk/wv/wo/gate`
 and MLP `gate/up/down` per block, plus the `txtmlp` projection Linears.
+
+`lora.variant` selects the update parameterisation. All six share the targets, save/load format and
+runtime scale knob, and are exact no-ops at step 0.
+
+| `variant` | update | notes |
+|---|---|---|
+| `lora` | `dW = B A`, low-rank product | the default |
+| `dora` | weight split into magnitude and direction, LoRA on the direction | lets direction change without forcing a change of scale |
+| `loha` | `dW = (B1 A1) * (B2 A2)`, elementwise | higher effective rank for the same parameter count |
+| `lokr` | `dW = A (x) B`, Kronecker product | ranks multiply rather than add; smallest files |
+| `oft` | `W' = R W`, `R` block-diagonal orthogonal (Cayley) | preserves neuron angles and norms by construction |
+| `boft` | `R` factorised into butterfly stages | same property, parameter cost linear in the width |
+
+For `oft` / `boft`, `lora.rank` is the **number of blocks**: larger means *fewer* parameters. Every
+variant except `lora` changes the rank/parameter relationship, so compare them at equal parameter
+count, not equal rank.
 
 ## 2c. Concept sliders
 
@@ -88,37 +111,38 @@ sweep. Subtle high-frequency axes (detail/sharpness) need a higher `slider.eta` 
 
 ## Resume, EMA, validation
 
-Both trainers checkpoint weights + optimizer/scheduler/RNG and write a `resume.json` marker. Set
-`paths.resume_from: auto` to continue a crashed run from the latest checkpoint; a SIGTERM/SIGINT saves
-a resumable checkpoint before exit. `optim.use_ema: true` keeps a CPU EMA of the trained weights
-(zero extra VRAM; saved alongside each checkpoint). `logging.val_every: N` logs a deterministic,
-low-variance held-out flow-matching loss on the `data.n_eval_holdout` eval split.
+Both trainers checkpoint weights + optimizer/scheduler/RNG and write a `resume.json` marker.
 
-## Lower VRAM: block swap + fp8 quantization
+- `paths.resume_from: auto` — continue from the latest checkpoint. SIGTERM/SIGINT saves a resumable
+  checkpoint before exit.
+- `optim.use_ema: true` — CPU EMA of the trained weights, no extra VRAM, saved with each checkpoint.
+- `logging.val_every: N` — deterministic held-out flow-matching loss on the `data.n_eval_holdout` split.
 
-`optim.blocks_to_swap: N` parks the **N deepest** transformer blocks on CPU and pages each to the GPU
-only for its forward/backward (`SingleStreamDiT.enable_block_swap`). It pairs with gradient
-checkpointing — the backward recompute re-pages a block in exactly when needed — and trades VRAM for
-host↔device copies (slower). Primary use is the **LoRA** trainer: only the frozen base is paged, so
-adapters stay resident and trainable. The full-FT trainer also supports it, although paging
-trainable weights adds transfer overhead. Enable it when the selected resolution and batch size
-need a lower device-memory footprint.
+## Lower VRAM: block swap + base quantization
+
+Three independent levers. They compose, and none changes the training objective.
+
+| option | stores / does | requires |
+|---|---|---|
+| `optim.blocks_to_swap: N` | parks the N deepest blocks on CPU, pages each in for its forward/backward | gradient checkpointing; costs host↔device copies |
+| `optim.quantize_base: fp8` | frozen attn+MLP weights as e4m3 + per-row scale, dequantized per forward | gradient checkpointing (forced on) |
+| `optim.quantize_base: int8` | the same weights rotated and stored as int8; the **matmul runs on int8 tensor cores**, so compute drops too | int8 tensor cores (Ampere+); incompatible with `variant: dora` |
 
 ```bash
 KREA2_OPTIM__BLOCKS_TO_SWAP=14 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
+KREA2_OPTIM__QUANTIZE_BASE=fp8 KREA2_OPTIM__BLOCKS_TO_SWAP=14 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
+KREA2_OPTIM__QUANTIZE_BASE=int8 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
 ```
 
-`optim.quantize_base: fp8` (LoRA only) stores the frozen base's attention+MLP weights in 8-bit (e4m3,
-per-row scale) and dequantizes on the fly to reduce the resident base. It **requires gradient
-checkpointing** — the per-forward dequant would otherwise be retained for the backward across every
-layer, erasing the saving — so the trainer enables it automatically when fp8 is on. The three levers
-compose without changing the training objective. Combining quantization and block swapping lowers
-device-memory use while adding dequantization and transfer overhead.
-
-```bash
-KREA2_OPTIM__QUANTIZE_BASE=fp8 KREA2_OPTIM__BLOCKS_TO_SWAP=14 \
-  python train_t2i_lora_cached.py --config config/t2i_lora.yaml
-```
+- `quantize_base` is LoRA-only. Block swap also runs in full-FT, paging trainable weights.
+- Block swap keeps adapters resident (`skip_trainable=True`); the backward recompute re-pages a block
+  exactly when needed.
+- fp8 forces gradient checkpointing on: otherwise the per-forward dequant is retained across every
+  layer and the saving is lost.
+- int8 (`convrot_int8.py`) rotates weights and activations by a fixed block Hadamard so one scale per
+  row stays accurate. The rotation is folded into the weight offline and cancels inside the matmul.
+  Backward is a straight-through estimator producing only an input gradient — hence frozen base with
+  adapters, never full fine-tune. `dora` needs a dequantized weight and refuses.
 
 ## 3. Monitor
 
@@ -174,10 +198,11 @@ slider.
 
 ## Regional prompting
 
-`sampling.sample_regions` places a different prompt in each image region — opt-in, the default sampler
-is byte-identical. It routes each region's image tokens to their own text segment via the model's
-`attn_mask_override` / `txt_attn_override` kwargs (both default `None`); `isolate_regions` (default on)
-keeps each region's image self-attention local, so two single-subject prompts render as two distinct,
-placed subjects (at the cost of a seam between regions — drop it for one coherent scene). Pass
-`regions=[{"prompt": ..., "box": (x0, y0, x1, y1)}]` with box edges as 0–1 fractions. Combine with a
-LoRA to place trained identities/styles per region.
+`sampling.sample_regions` places a different prompt in each image region. Opt-in — the default
+sampler is byte-identical. Each region's image tokens are routed to their own text segment via the
+model's `attn_mask_override` / `txt_attn_override` kwargs (both default `None`).
+
+- `regions=[{"prompt": ..., "box": (x0, y0, x1, y1)}]`, box edges as 0–1 fractions.
+- `isolate_regions` (default on) keeps each region's image self-attention local: distinct placed
+  subjects, at the cost of a seam. Drop it for one coherent scene.
+- Combines with a LoRA to place trained identities or styles per region.
