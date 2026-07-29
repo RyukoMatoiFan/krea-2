@@ -131,6 +131,25 @@ def reference_delta_flags(samples: list[dict], paths, annotations: dict) -> torc
     ], dtype=torch.bool)
 
 
+def cache_edit_ref_geometry(samples: list[dict], expected: str) -> str:
+    """Validate that a batch's cached reference geometry matches the active run."""
+    geometries = {
+        str(sample.get("edit_ref_geometry", "square")).lower()
+        for sample in samples if sample.get("refs")
+    }
+    if not geometries:
+        return "square"
+    if len(geometries) != 1:
+        raise RuntimeError(
+            f"batch mixes edit reference geometries {sorted(geometries)}; use separate cache dirs")
+    actual = next(iter(geometries))
+    if actual != expected:
+        raise RuntimeError(
+            f"edit cache geometry is {actual!r}, but data.edit_ref_geometry is {expected!r}; "
+            "use the matching setting or rebuild the cache")
+    return actual
+
+
 def validation_group_paths(paths, annotations: dict, load_fn) -> dict[str, list[str]]:
     """Group annotated validation paths without deriving labels from filenames."""
     groups = {}
@@ -362,9 +381,9 @@ def render_previews(dit, vae, encoder, prompts, out_path, *, res, steps, guidanc
 def _montage_refs(refs, res):
     """Arrange 1..N reference images into a single ``res``x``res`` cell as a near-square grid.
 
-    One ref fills the cell; 2 sit side by side; 3-4 -> 2x2; 5-6 -> 2x3; 7-9 -> 3x3. A grid keeps each
-    reference roughly square and legible even at 7 refs, instead of the thin vertical slivers a single
-    side-by-side row would give. Empty grid slots stay black.
+    One ref fills the cell; 2 sit side by side; 3-4 -> 2x2; 5-6 -> 2x3; 7-9 -> 3x3. The grid keeps
+    each reference roughly square and legible across the supported counts. Empty grid slots stay
+    black.
     """
     import math
 
@@ -384,7 +403,8 @@ def _montage_refs(refs, res):
 
 
 def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, guidance, seed,
-                         vlm_cond=False, vlm_image_size=384):
+                         vlm_cond=False, vlm_image_size=384, edit_ref_geometry="square",
+                         fit_ref_crop_tolerance=0.08):
     """Edit contact-sheet: one row per example, columns [ref(s) | model edit | target (if given)].
 
     ``examples`` = list of {"instruction": str, "tgt": path?} plus EITHER "src" (single-reference edit)
@@ -405,13 +425,12 @@ def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, g
             refs = [Image.open(p).convert("RGB") for p in ref_paths]
             edited = edit_sample(dit, vae, encoder, ex["instruction"], refs,
                                  width=res, height=res, steps=steps, guidance=guidance, seed=seed,
-                                 vlm_cond=vlm_cond, vlm_image_size=vlm_image_size)
-            # ALL references go into a SINGLE source cell so every row stays exactly
-            # [source | model-edit | target] = 3 columns -- keeps the dashboard's fixed 3-way slice
-            # correct while still showing every reference (a variable per-row column count instead
-            # pads short rows with black and the dashboard then mis-slices: black "ground truth",
-            # noise bleeding into "source"). Refs are arranged in a near-square GRID rather than a
-            # single row so many references (up to 7) stay legible instead of thin vertical slivers.
+                                 vlm_cond=vlm_cond, vlm_image_size=vlm_image_size,
+                                 edit_ref_geometry=edit_ref_geometry,
+                                 fit_ref_crop_tolerance=fit_ref_crop_tolerance)
+            # Combine all references in one near-square source cell. Every row therefore preserves
+            # the dashboard's fixed [source | model-edit | target] layout while keeping each
+            # reference legible.
             src_cell = _montage_refs(refs, res)
             cells = [src_cell, edited]
             if ex.get("tgt") and os.path.exists(ex["tgt"]):
@@ -494,6 +513,10 @@ def main():
     #                     (same signal as caching, but no ~3.8MB/prompt 12-layer text on disk).
     train_te = (o.te_lr > 0.0)
     use_live_text = train_te or (not has_cached_text)
+    if cfg.data.edit_vlm_cond and has_cached_text:
+        raise SystemExit(
+            "data.edit_vlm_cond requires a latents-only edit cache; rebuild with "
+            "precache_edit.py --no-cache-text so grounded text is encoded live")
     te_lr = o.te_lr if o.te_lr > 0 else 0.0
     print(f"caches: {n_train} train / {len(eval_paths)} eval, buckets={bucket_keys}, "
           f"cached_text={has_cached_text}, train_te={train_te}, live_text={use_live_text}", flush=True)
@@ -522,6 +545,13 @@ def main():
         if _te_mode not in ("full", "lora"):
             # Reject typos so the selected training mode and checkpoint format stay explicit.
             raise SystemExit(f"optim.te_mode must be 'full' or 'lora', got {o.te_mode!r}")
+        quant_te = str(o.quantize_te or "").lower()
+        if quant_te not in ("", "fp8"):
+            raise SystemExit(f"unknown optim.quantize_te {o.quantize_te!r}; expected '' or 'fp8'")
+        if quant_te and train_te:
+            raise SystemExit(
+                "optim.quantize_te is only supported for a frozen text encoder, "
+                "not full TE fine-tuning or TE-LoRA")
         if train_te and _te_mode == "lora":
             te_adapters = inject_lora_te(encoder.qwen, lc.te_rank or lc.rank, lc.alpha)
             encoder.qwen.train()
@@ -557,15 +587,18 @@ def main():
                 if nunexp:
                     raise SystemExit(f"te_init has {nunexp} unexpected keys -- refusing a silently "
                                      f"ignored warm start ({cfg.paths.te_init})")
-                # save_ckpt writes the FULL encoder state_dict, so a correct te_init has ZERO
-                # missing keys. Anything missing means a truncated/mismatched file whose remaining
-                # weights would stay randomly initialised -- printing that was not enough.
+                # A full-encoder checkpoint must contain every encoder key; missing keys would leave
+                # the corresponding parameters at their initial values.
                 if nmiss:
                     raise SystemExit(
                         f"te_init is missing {nmiss} keys ({cfg.paths.te_init}); the rest of the "
                         f"encoder would keep its initial weights. Refusing a partial warm start.")
                 print(f"TE warm start: full encoder from "
                       f"{os.path.basename(cfg.paths.te_init)} (complete)", flush=True)
+        if quant_te == "fp8":
+            from quantize import quantize_frozen_linears_fp8
+            nq = quantize_frozen_linears_fp8(encoder.qwen)
+            print(f"fp8-quantized {nq} frozen Qwen3-VL Linears", flush=True)
         preview_encoder = encoder
     # eval_steps can request a render independently of sample_every; without this the preview
     # resources are never built, do_preview() silently no-ops, and the scorer sees a missing sheet.
@@ -574,6 +607,13 @@ def main():
     if need_preview and preview_encoder is None:
         # DiT-only training (cached text): still need a frozen encoder to render previews.
         preview_encoder = build_encoder(cfg, device, dtype, train=False)
+        quant_te = str(o.quantize_te or "").lower()
+        if quant_te not in ("", "fp8"):
+            raise SystemExit(f"unknown optim.quantize_te {o.quantize_te!r}; expected '' or 'fp8'")
+        if quant_te == "fp8":
+            from quantize import quantize_frozen_linears_fp8
+            nq = quantize_frozen_linears_fp8(preview_encoder.qwen)
+            print(f"fp8-quantized {nq} preview Qwen3-VL Linears", flush=True)
 
     # Preview set: curated edit examples ([src|edit|tgt] rows) when a manifest is given, else t2i prompts.
     edit_examples = None
@@ -592,7 +632,9 @@ def main():
                                      res=cfg.data.resolution, steps=lg.sample_steps,
                                      guidance=lg.sample_guidance, seed=cfg.runtime.seed,
                                      vlm_cond=cfg.data.edit_vlm_cond,
-                                     vlm_image_size=cfg.data.vlm_image_size)
+                                     vlm_image_size=cfg.data.vlm_image_size,
+                                     edit_ref_geometry=cfg.data.edit_ref_geometry,
+                                     fit_ref_crop_tolerance=cfg.data.fit_ref_crop_tolerance)
             else:
                 render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count], out,
                                 res=cfg.data.resolution, steps=lg.sample_steps,
@@ -707,7 +749,9 @@ def main():
                 # so a caption saying "image_2" resolves to refs[1] in both the text encoder and the
                 # DiT stream. Passing only ref_paths[0] would make multi-reference composition
                 # instructions ungroundable (the encoder would never see the second subject).
-                vlm_imgs = [[_vlm_resize(Image.open(p), cfg.data.vlm_image_size)
+                vlm_imgs = [[_vlm_resize(
+                                 Image.open(p), cfg.data.vlm_image_size,
+                                 cfg.data.vlm_image_min_size, rng)
                              for p in s["ref_paths"]] for s in samples]
             if vlm_imgs is not None and drop_refs and cfg.data.ref_dropout_prob > 0.0:
                 ref_drop = torch.rand(len(samples)) < cfg.data.ref_dropout_prob
@@ -740,9 +784,16 @@ def main():
                     f"batch mixes different reference counts {counts}: caches are bucketed by target "
                     f"grid only, so multi-reference data requires batch=1 (or bucketing by ref-count)")
             ref_grids = [(r["grid_h"], r["grid_w"]) for r in samples[0]["refs"]]
+            if any([(r["grid_h"], r["grid_w"]) for r in s["refs"]] != ref_grids
+                   for s in samples[1:]):
+                raise RuntimeError(
+                    "batch contains different fitted reference grids; set optim.batch=1 or bucket "
+                    "samples by complete reference layout")
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]
-        return z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags
+        ref_geometry = cache_edit_ref_geometry(samples, cfg.data.edit_ref_geometry)
+        return (z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags,
+                ref_geometry == "fit")
 
     def sample_batch():
         key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
@@ -791,14 +842,15 @@ def main():
             encoder.qwen.eval()
 
         def loss_fn(packed, q):
-            (z0, ctx, mask, gh, gw, refs, ref_grids, _, _), vsched = packed
+            (z0, ctx, mask, gh, gw, refs, ref_grids, _, _, center_refs), vsched = packed
             t = float(vsched(torch.tensor([float(q)])).item())
             g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
             if refs is not None:
                 return edit_training_step(dit, z0=z0, refs=refs, ref_grids=ref_grids, context=ctx,
                                           text_mask=mask, grid_h=gh, grid_w=gw, schedule=vsched,
                                           flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
-                                          ref_dropout_prob=0.0, t_override=t, disable_weighting=True)
+                                          ref_dropout_prob=0.0, t_override=t, disable_weighting=True,
+                                          center_refs=center_refs)
             return t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
                                      schedule=vsched, flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
                                      t_override=t, disable_weighting=True)
@@ -823,7 +875,7 @@ def main():
                           extra_meta={"run_digest": run_digest})
         te_path = None
         if train_te and encoder is not None:
-            if te_adapters:      # TE-LoRA: store adapters (MBs) instead of the full ~9.6GB encoder
+            if te_adapters:      # TE-LoRA stores adapter tensors instead of full encoder weights
                 te_path = os.path.join(ckpt_dir, f"te_lora_{tag}.safetensors")
                 save_lora(te_adapters, te_path, rank=lc.te_rank or lc.rank,
                           alpha=lc.alpha or (lc.te_rank or lc.rank),
@@ -1042,7 +1094,8 @@ def main():
 
     for step in range(start_step, steps):
         _state["step"] = step
-        z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags = sample_batch()
+        (z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags,
+         center_refs) = sample_batch()
         schedule = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
                                            max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
                                            max_seq_len=fl.max_image_seq_len)
@@ -1058,7 +1111,7 @@ def main():
                                       text_mask=mask, grid_h=gh, grid_w=gw, schedule=schedule,
                                       flow_cfg=fl, generator=gen, cfg_dropout_prob=o.cfg_dropout_prob,
                                       ref_dropout_prob=cfg.data.ref_dropout_prob, loss_mask=lmask,
-                                      ref_drop_mask=ref_drop)
+                                      ref_drop_mask=ref_drop, center_refs=center_refs)
         else:
             loss = t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
                                      schedule=schedule, flow_cfg=fl, generator=gen,

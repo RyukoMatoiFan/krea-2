@@ -25,7 +25,7 @@ flow:
   base_image_seq_len: 256
   max_image_seq_len: 6400
   sigma: 1.0
-  timestep_weighting: uniform
+  timestep_weighting: uniform  # weighted = uniform unshifted t + empirical 1,000-step loss curve
 logging:
   log_every: 25
   ckpt_every: 1000

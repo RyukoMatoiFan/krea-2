@@ -45,6 +45,7 @@ class PathsConfig:
   ckpt_dir: str = ""         # "" -> f"{output_dir}/ckpts"
   results_dir: str = ""
   resume_from: str = ""      # crash recovery: "auto" = resume the same run from {ckpt_dir} marker
+  lora_init: str = ""        # weights-only LoRA warm start; keeps fresh optimizer/scheduler/step
   # Weights-only WARM START for the text encoder, mirroring dit_repo/dit_file for the DiT. Without
   # this a warm-started DiT is paired with a BASE Qwen3-VL even though it was co-trained against a
   # drifted one -- resume_from would carry the TE, but it also restores optimizer/scheduler state
@@ -104,6 +105,9 @@ class DataConfig:
                                    # instead of reading which image the instruction names.
   edit_vlm_cond: bool = False      # (edit) also feed the source image through the Qwen3-VL vision tower
   vlm_image_size: int = 384        # max source-image side for the VLM conditioning path
+  vlm_image_min_size: int = 0      # >0: train-time uniform grounding-size jitter [min, vlm_image_size]
+  edit_ref_geometry: str = "square"  # square (full-canvas stretch) | fit (AR-preserving, centered RoPE)
+  fit_ref_crop_tolerance: float = 0.08  # fit mode: near-matching ARs within this fraction fill target
   train_list: str = ""             # JSON list of cache filenames (repeats = oversampling)
   eval_list: str = ""              # JSON list of held-out cache filenames (else idx < n_eval_holdout)
   cache_annotations: str = ""      # optional JSON map: filename -> neutral training annotations
@@ -142,15 +146,16 @@ class OptimConfig:
   quantize_base: str = ""          # LoRA: "" off | "fp8" (e4m3 storage, dequantized per forward)
                                    # | "int8" (ConvRot W8A8: the matmul itself runs on int8 tensor
                                    # cores, so it lowers memory AND compute; needs Ampere or newer)
+  quantize_te: str = ""            # frozen live Qwen3-VL: "" off | "fp8" weight storage
+  compile_blocks: bool = False     # LoRA: torch.compile each transformer block after adapter injection
+  compile_mode: str = "default"    # torch.compile mode
   weight_decay: float = 0.01       # full-FT AdamW weight decay
   te_lr: float = 0.0               # joint full-FT: separate (lower) LR for the text encoder;
                                    # 0 -> lr/10 when training the DiT too, else lr (TE-only stage)
                                    # te_lr = 0 keeps the text encoder frozen
   te_mode: str = "full"            # how the TE trains when te_lr>0: full = fine-tune all Qwen3-VL
-                                   # weights | lora = frozen base + TE-LoRA adapters (lora.te_rank).
-                                   # 'lora' is the safer default on a narrow single-domain corpus,
-                                   # where full-FT of a chat-VLM encoder risks catastrophic
-                                   # forgetting; it also cuts the TE checkpoint from ~9.6GB to MBs.
+                                   # weights | lora = frozen base + compact TE-LoRA adapters
+                                   # (lora.te_rank), suitable for limiting encoder drift.
   train_dit: bool = True           # joint trainer: also full-FT the DiT. False = DiT frozen, TE-only
   optimizer_state: str = "adafactor"  # full-FT moment backend: adamw (offload) | adafactor (on-GPU)
   preload_caches: bool = True      # full-FT trainers: preload latent caches into RAM
@@ -171,7 +176,7 @@ class FlowConfig:
   base_image_seq_len: int = 256
   max_image_seq_len: int = 6400
   sigma: float = 1.0
-  timestep_weighting: str = "uniform"  # uniform | bell | min_snr | sigma_sqrt | cosmap
+  timestep_weighting: str = "uniform"  # uniform | bell | min_snr | sigma_sqrt | cosmap | weighted
   min_snr_gamma: float = 5.0
   noise_offset: float = 0.0            # per-channel constant added to the sampled noise
   input_perturbation: float = 0.0      # extra noise on x_t only (target stays clean)
@@ -194,7 +199,7 @@ class LoggingConfig:
   eval_scorer: str = ""       # "module:function" returning a float (kwargs: sheet_path, examples,
                               # step). "" -> fall back to val_loss (requires val_every/val data).
   eval_metric_mode: str = "max"   # max = larger is better (quality) | min = smaller is better (loss)
-  keep_last: int = 2          # step-tagged checkpoints retained by RECENCY (was hardcoded 2)
+  keep_last: int = 2          # step-tagged checkpoints retained by recency
   keep_best: int = 0          # 0 = off; retain N best-by-metric checkpoints under a separate
                               # `*_best_step*` namespace the recency rotation never touches
   # Multi-criterion selection. The scorer may return a DICT of named metrics; these order them.
@@ -376,6 +381,19 @@ def load_config(path: str | None = None) -> TrainConfig:
   if not cfg.paths.ckpt_dir:
     cfg.paths.ckpt_dir = f"{cfg.paths.output_dir}/ckpts"
 
+  from edit_geometry import validate_edit_ref_geometry
+  cfg.data.edit_ref_geometry = validate_edit_ref_geometry(cfg.data.edit_ref_geometry)
+  if not 0.0 <= cfg.data.fit_ref_crop_tolerance < 1.0:
+    raise ValueError(
+      "data.fit_ref_crop_tolerance must be in [0,1), got "
+      f"{cfg.data.fit_ref_crop_tolerance}")
+  if cfg.data.vlm_image_size <= 0:
+    raise ValueError(f"data.vlm_image_size must be positive, got {cfg.data.vlm_image_size}")
+  if not 0 <= cfg.data.vlm_image_min_size <= cfg.data.vlm_image_size:
+    raise ValueError(
+      "data.vlm_image_min_size must be between 0 and data.vlm_image_size, got "
+      f"{cfg.data.vlm_image_min_size} and {cfg.data.vlm_image_size}")
+
   return cfg
 
 
@@ -403,14 +421,15 @@ def apply_runtime(cfg: TrainConfig) -> None:
   if cfg.runtime.tf32:
     set_tf32(True)
 
-  # mmdit.py decorates RMSNorm / PositionalEncoding / LastLayer with @torch.compile(fullgraph=True).
-  # During training (+ grad-checkpointing) and the no-grad sampler, grad-mode and sequence shapes
-  # change, thrashing dynamo's recompile limit and HARD-failing previews (fullgraph=True). Compile
-  # is an inference nicety not needed for training correctness -> disable dynamo during training.
-  os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+  # The default training path disables Dynamo because varying training/preview shapes can exhaust
+  # its recompile cache. Explicit per-block compilation owns that tradeoff and enables Dynamo.
+  if cfg.optim.compile_blocks:
+    os.environ["TORCHDYNAMO_DISABLE"] = "0"
+  else:
+    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
   try:
     import torch._dynamo
-    torch._dynamo.config.disable = True
+    torch._dynamo.config.disable = not cfg.optim.compile_blocks
   except Exception:
     pass
 

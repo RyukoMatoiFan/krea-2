@@ -1,19 +1,13 @@
-"""Record what a run ACTUALLY executed, so a finished run can be audited after the fact.
+"""Record the code, configuration, dataset, and environment used by each run.
 
-A configured setting can silently fail to take effect -- for example when the execution host runs a
-stale copy of the module that forwards it -- and such a parameter is generally invisible in loss
-curves, sample previews and downstream evaluation. Without a record of what actually ran, there is no
-way after the fact to answer "what code and what settings did this run really use?".
-
-So at startup a run writes a manifest containing:
+At startup a run writes a manifest containing:
 
 * the RESOLVED config (post env-override), not the yaml on disk
-* a hash of every repo module actually IMPORTED — taken from ``sys.modules``, so it reflects the
-  files that were really loaded rather than a hand-maintained list that can drift
+* a hash of every imported repository module, taken from ``sys.modules``
 * dataset identity (cache dir, train list, counts) and environment/GPU/library versions
 
-The digest is short enough to embed in checkpoint metadata, so a checkpoint can be traced back to
-the exact code that produced it.
+The digest is embedded in checkpoint metadata so each checkpoint can be traced to its producing
+code and settings.
 """
 from __future__ import annotations
 

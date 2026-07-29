@@ -441,6 +441,14 @@ class SingleStreamDiT(nn.Module):
         self._swap_device: torch.device | None = None
         self._swap_skip_trainable = True
 
+    def compile_blocks(self, mode: str = "default") -> int:
+        """Compile transformer blocks independently and return the number wrapped."""
+        if self._swap_blocks:
+            raise RuntimeError("block compilation must be configured before block swap")
+        for i, block in enumerate(self.blocks):
+            self.blocks[i] = torch.compile(block, mode=mode)
+        return len(self.blocks)
+
     def enable_block_swap(self, num_blocks: int, device, *, skip_trainable: bool = True) -> list[int]:
         """Offload the ``num_blocks`` deepest transformer blocks to CPU, paging each to ``device``
         for its forward/backward and back to CPU afterward. Trades DiT-resident VRAM for per-step

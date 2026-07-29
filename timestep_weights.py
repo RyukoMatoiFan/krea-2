@@ -1,0 +1,26 @@
+"""Empirical 1,000-step flow-matching loss weights.
+
+The float32 table is stored as a compressed payload to keep the source compact. It is adapted from
+ai-toolkit's Apache-2.0-licensed ``toolkit/timestep_weighing/default_weighing_scheme.py`` at commit
+``7e7053fc9a2e78df999d05ab18d1e64af02834a5``:
+https://github.com/ostris/ai-toolkit/blob/7e7053fc9a2e78df999d05ab18d1e64af02834a5/toolkit/timestep_weighing/default_weighing_scheme.py
+"""
+from __future__ import annotations
+
+import base64
+import struct
+import zlib
+
+import torch
+
+
+_PAYLOAD = b"c-jq?d0fuf7ss0xgzT~nQ^vlf{5;=hspnm^2$e*kkTr=ADoR>yB}t{UYEO%_mzJl;GGkw+7>2PmvJ+z&>+k!==XK7x_j~UBo^w9;p1b^x2QBSu@cLsN<I*;A&u}yTbA2%w;?J93gUI_O6ji4PKJAELP4OOd+ame9GMYw>{dC`cfD2C#V*dUR@vCF`bAKFPA`=L-OysBb!z_+SB1SKnw-Zu0y&{F6tEpV=kxt%-3<@u1uzGAJo9AWGZjjAeog7T`a>;m;Oa93`?%vGDF1vu7Nym^xA7jIpLKJaD#J?*dIJ_A9J|)z6l<;#(2|o&slk@pF-Y%tdEiT1x+6iKgp1`JC8QZMOxR_jyNv8^~ZmOWDt%7%VDjB=Aiu4av+?-!c%H<lYN7qspP>aU7TI5Z2ylSf>^hF(Wuh*eBu%0RMdRB;-F}xn#0S(mjY2a<w28v(SQ@E&+zTS<D32($EtC5QljW`E2QsmP}zH1YMe4D6P+C=q|CeC*>;rXfw?barw<syPq<ZV|`yG+H<c`91}R^fkBh2b3)M%gNM_G_m8wTf34RFo#G_$8?spXg>B0-NdW*i3|mnjJc7v|5_EaJiY6o7F^ltGREbrr=jKtWa}wwwh<%)O>x>%%;a`tee$*j#cy5Lp3#`ZknKGpqq#mH4~1j@efziU-Yj`QnS-f%~*3aZhh1&6vuq@)tnI5xl-87mru>?JKv06S~JU6HuE^S8C}<A1`KJ&@4kxFQ=940xtZ8ADq6x+*k`Dy^H5<oUd5HRCeG@qnB3UJ)qo}r(Zs=!CO+DW`ROU@zc;e1t&!4-Moj!0@mSu-ltGPjv^4NOu>qHx4TMHDaMiVez`+e94-xGf^=K#5)5EczoyPSH_;`|GsV8~4>?CV_P7*NsBxW6TOe(LVPh}lvx7RUGsAJHFS|;AEB_X|*ON(lGWKhd3?OJBn*DyGshGgR!+9uR+<#jdDdDT2#QB9J4H3@^NxpA+G9dT9kTUo`@K~<QyRAP9$60PJ)-Y%=;g<&Pbbt=U?Rj_ey1s&!UOf;&X?oBysa>~(PQ_dI4>GZ9PqS`WIH<jVEpo}No%LqDs0`F}nh?{$YuX-n_yi|&7a4BDsOKD$FN|t^p8P|^E7;>C5X2*H;ZwV)hOE4}e;k0-*I*d!GeO8QLUNNh^i|MOh%>L2E6h10q+0i007Z#yAvWU-*3vtXZB+{#pQznIIe>_G()iDllImX2?$9VLr0N>&QUac#@%BFz9U-R+#EuR%Z`M503=Z8T)zdp$0&%``3Hso=3Vjk+(x%4=mOP*gY9skQEsw0O!RXKFtn1jod9L98H^SvOO{^8l=n`X1;Qx?0*v*@3nMT<ukX(O{(_ac+H<C#44$;90_6V1;@(W*a6zW-5brW{4Cd6cX(8JvyCpl)Uc<-Ibn{Vko}!_wJipU%IA>CAhQ#@(VcK6#~aY(g5cj#Ro-q%w13DiKzxJm@Ccms0RLkV5{V6o&nhLfC_3%rlbtx;mM6qmqelJAzr^5l(p?!F}=(V%{d<)s%!ZI0*-{ByN08<n`G^PDUoO);<vpy+oGZKg{=x!z@{Tm|^1%Gow8L+v)^j0utCOOW?9r0v2cExe*c1E7N#V`oz=P634#@aZFwuN6&F_EPHl{-6sy=yzvnB#)t5EA4^$dECT~$DYA*hQ7@J=R}a!H?jSGbA7u5<2PtTap)xmye%>+co*cvGF9#^CI)IUQSJ#*wAX?)9r&^=wnH0^q718`TE}A3H_7hUHpJ<=`%rM>0yEjqnP)9K$B8tyWQA{5gg>WyDulbS8T_4FXWh9ezB1!*kADM^tvB+s3UPJa_)V`OPqP>**?q!wPUIuIL#o_uMe3SMN=e~yvWB1Vdb~jb^yQvS`O{)EF*7e(s&AnY173@N1{Vv9s?c%oPE_^OWP?8owlv@PnCr4oNF`R!I!s!+p&PvyCMvo8Y@VhYLYQsp~9Y%vg7`_9-Sol1Y3+17t1%;As6G}t3P;768V3ZrezuqAnm>z;{_Ymq@f~n397P%CRLK#evUa)v4?8HRA6X9kM*ER)lK`#jN>K&}J-ND9pfmHegV%Iy6iNyivTLw^fXFIt;+bJEeozpejkXdg-+U}2ExIa(F`18EckJ^=fy!__Nz7$`sSo)IDwiO{{D`$sq#lL(D!)I^7<kMz6_iv`R@n&xS=|kEkAGUP&LA!brtuC85^kpM4@nUbb+(^;u4eZ~ufd>W~xLoJW(<R>A`?j7_1?yR6wVrA1>+syQj@U`-ID5&9IeuO|9_~f2rnTaEUyFvuT8<TZ5-`V;Y)wxR^4HK}w}x+@Joxpn2Nu&j(0#BPA#OD*O;=;~&ng0Ut-@QfitB%`q+iTRQiYWm++M-uZ7aB9w1U>w<xJYWoFe1p9J{>?x1eSG7`cq#KinC$(;erL?r7au%CPXIG)!2^rK?N0vU3SqQ<w0)buq4c7t_gdF>7DB(JS2z+j(wi^>QQZtSebwt_144qI-Q2N5U6jXt9V(PZna5x{#k;7IOLf0)DGlz}@u=_(OjIS1-8meXk33CN6|Nbw(rG8N2z;*!Op4;N|&ZEb|#@KA&4}=P|5s9uHT|qs!=d?D)$G%Qz>F%yi;S7bniB<`VBWmo?1g&{Ib~6+1FwjU%rII%08a4gqO%F!z|l*l}~vyWzmOWCza7cOY-D0~t5%*_mX|Dm!~-_OK`Ux*hA|?RdSw4sSy{LT}H;@W^ZyIL&7I(Aj*uKZ}Q%vxxMZg^e(aJMA+WR5p{}w$9|CRK!<X8h*D$*k((!gDu^)Y{|MdgQ!C@&|5l#yGAo;ePqMoG8=TZ+OW^ohORwrh`4Xfq+`}B_qC=@YR&kr);v>Lp^mpAWr-CNjI3z-U`ghAOA_KN>AA*|!ILc+t7FNA-=}jUVLGL2r!!NS&QQ(ioVhU#dHyuq{ipHCdK$L|PUAzH1wKs{*hE|KY_$a%#ujL5TZr5<$0N_2*d69fbvCEM(428EA@33dC&DT}80-WijX_Tr{2nU#uRw`1LW#AT5-pS@X)1ATH)Hr2GghXXiT&D)gU)8?PB9~;tC`q)P0>}EaxKG@9$}_LyPHyMWr}jBDFZZ2xp7rNScQU>`xR(xQV>2vA@*_wak>hOI^>+cD<`)>PDqp-qb+ix7t0B=lA|`3W1uhR)K?j04`j@^DC1*}j6R7n-mj9OX)hzsT!zs|8R=bQO#3Fq@~#xSb5bT%OSxJkWm>e9zz`{e*GaiEPfFD^DN9YH-0LmnR2L~79|RoU2)z1B;MNs^#1jINECC^2;6#K#-3oyZiv^OL1q|j0xLXToC<HP_2%ItyC>SW<rYDfwRiKNu!0j&*PJNW{@~wpXcO?}4B|+zJiTFN{aP*RdJe7oS5mAj2f<@V>R)S5n1kXwd$IB(S7fCpuDM7bbg24$1d&Id#$0Z0Q60FiCOs<gdtwvl!^gAf}JgAp&GG9VknS?*8B<yICFzSj#j7P#!5l{b-kn%}_iwKpjKz3gN&;9~8eirC7RABuifhco<vvUO;T?EpW3b=X;$O8p-iSa*35U9=<$f*?VMggZ*fl;>vj9&{Zd@t~_vlPbxQZfytw267Wu9Wg(k(82E;@EmAr~Spe$4E&yDkY~}N{U*_)BEDwM=4viW$5&mF;=YK4ylYl2N`ioWX$%JVY^c%zI$aPX2_V-BxCp$vDSBF*gcVPzq6c++Hxk1morWwC%{dP<0?5OK62thMBb#z>0cvf<s~`pEpq;8lk?_3IYC_&IQ3OfC35ehQi0`c1rJ5(Aj-o_75wR?V4sipjh}*+-3lT_G>a$;P;hFCf<c=V%vq&C+gm}(Mg_5+3MwrX^pz^m8l%8eUqO<%hsHTM{nF&LCCGX1DQAbBsEhw<s3~X4H5pF|WE=?)IXqKFfS!!}i&B<HiF~w@67Wf2XrX}SA^|%cfpcPA?dC{W{@+w;qo?w4)Koq-{12;H|6|_eDM&r0;Pu3WEvrp<f8UsGPR8_WnM{pxGI_N|%<680uyYbaZcfCSiS$mLz?<je(VspZV#m?gI+jH}$D-pnhDm!zQ+9q7*E^5m59vsx-Xl1b{VQXy4d;1>A#?N$nK{M)Cx>6~^&ZCbT|*g{{xij8L+E#EFp8Ul_}Vs*z;6S1{z0EFKj~x9r9YQ?^+SJDUzSbiL-my2m`i&xQPPuUp$B7T>G8p>JGCC&a1HH>c9JeTE4pBIt~08~ofy)o6E222oVL_vy@wXN!ZeZP{e;Hv8pPfCp<L|vUFn|mRr&VYXXP(r{!{jJ{ir<a`d+!m_np$FyhHh1|BW&(`<3#(^Gl`o_2<e5_Ro|XMm$yKZF{0@%4}Co^leu@eDqjZUiet4Y4=!ZllqU+`beAdhIyM(sC%S**riQr^P^4qe?Ft7M*"
+_RAW = zlib.decompress(base64.b85decode(_PAYLOAD))
+EMPIRICAL_1000 = struct.unpack("<1000f", _RAW)
+
+
+def empirical_timestep_weight(t: torch.Tensor) -> torch.Tensor:
+    """Look up the source curve for Krea flow time ``t`` (1=noise, 0=data)."""
+    table = torch.as_tensor(EMPIRICAL_1000, device=t.device, dtype=t.dtype)
+    index = ((1.0 - t.clamp(0.001, 1.0)) * 1000.0).round().long().clamp(0, 999)
+    return table[index]

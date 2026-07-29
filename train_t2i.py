@@ -25,6 +25,7 @@ import re as _re
 import torch
 from torch import Tensor
 
+from edit_geometry import centered_grid_offsets
 from training_utils import flow_loss, timestep_weight
 
 
@@ -35,6 +36,7 @@ def build_pos_mask(
     *,
     ref_grids: list[tuple[int, int]] | None = None,
     ref_drop_mask: Tensor | None = None,
+    center_refs: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Build combined ``pos`` (B, S, 3) and ``mask`` (B, S) for ``[text][refs...][target]``.
 
@@ -50,11 +52,16 @@ def build_pos_mask(
     pos_blocks = [torch.zeros(L, 3, device=device)]  # text at origin
     mask_blocks = [text_mask]
     n_ref = len(grids) - 1  # the target grid is always last
+    offsets = (
+        centered_grid_offsets((grid_h, grid_w), list(ref_grids or []))
+        if center_refs else [(0.0, 0.0)] * n_ref
+    )
     for j, (gh, gw) in enumerate(grids):
         ids = torch.zeros((gh, gw, 3), device=device)
         ids[..., 0] = 0 if j == n_ref else j + 1  # temporal/stream index: target -> 0, ref i -> i+1
-        ids[..., 1] = torch.arange(gh, device=device)[:, None]
-        ids[..., 2] = torch.arange(gw, device=device)[None, :]
+        off_h, off_w = offsets[j] if j < n_ref else (0.0, 0.0)
+        ids[..., 1] = torch.arange(gh, device=device)[:, None] + off_h
+        ids[..., 2] = torch.arange(gw, device=device)[None, :] + off_w
         pos_blocks.append(ids.reshape(gh * gw, 3))
         # Reference positions are attention-masked for reference-dropped samples so the no-reference
         # branch is genuinely reference-free. Zeroing the latents is not enough: a zero token still
@@ -101,9 +108,11 @@ def encode_text_with_ref_dropout(encoder, caps, vlm_imgs, drop_mask):
     return ctx, mask
 
 
-def sample_timesteps(schedule, bsz: int, device, generator=None) -> Tensor:
-    """Draw a shifted training timestep per sample: ``t = schedule(U(0,1))`` (Krea dynamic shift)."""
+def sample_timesteps(schedule, bsz: int, device, generator=None, weighting: str = "uniform") -> Tensor:
+    """Draw training timesteps, using the empirical recipe's linear grid when selected."""
     u = torch.rand(bsz, device=device, generator=generator)
+    if weighting == "weighted":
+        return u.clamp_min(0.001)
     return schedule(u).to(device)
 
 
@@ -134,7 +143,8 @@ def t2i_training_step(
     if t_override is not None:
         t = torch.full((B,), float(t_override), device=device, dtype=torch.float32)
     else:
-        t = sample_timesteps(schedule, B, device, generator).float()
+        t = sample_timesteps(
+            schedule, B, device, generator, flow_cfg.timestep_weighting).float()
 
     # Noise (+ optional per-channel offset), build x_t and the velocity target in float32.
     noise = torch.randn(z0.shape, device=device, generator=generator, dtype=torch.float32)
@@ -246,6 +256,7 @@ def edit_training_step(
     loss_mask: Tensor | None = None,
     ref_t0: bool = True,
     ref_drop_mask: Tensor | None = None,
+    center_refs: bool = False,
 ) -> Tensor:
     """Flow step for edit / multi-reference: pack ``[text, refs(clean), target(noised)]``, loss on target.
 
@@ -264,7 +275,8 @@ def edit_training_step(
     if t_override is not None:
         t = torch.full((B,), float(t_override), device=device, dtype=torch.float32)
     else:
-        t = sample_timesteps(schedule, B, device, generator).float()
+        t = sample_timesteps(
+            schedule, B, device, generator, flow_cfg.timestep_weighting).float()
 
     noise = torch.randn(z0.shape, device=device, generator=generator, dtype=torch.float32)
     if flow_cfg.noise_offset:
@@ -297,7 +309,7 @@ def edit_training_step(
     img = torch.cat([*ref_tokens, x_t], dim=1)  # [refs..., target] along the sequence
     # Pass the dropout mask so dropped references are ATTENTION-MASKED, not merely zeroed.
     pos, mask = build_pos_mask(grid_h, grid_w, text_mask, ref_grids=ref_grids,
-                               ref_drop_mask=rdrop)
+                               ref_drop_mask=rdrop, center_refs=center_refs)
 
     # Number of leading (clean) reference image tokens -> the DiT gives them t=0 modulation when ref_t0.
     ref_len = sum(int(r.shape[1]) for r in ref_tokens) if ref_t0 else 0

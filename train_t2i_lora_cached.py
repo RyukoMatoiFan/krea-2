@@ -19,7 +19,8 @@ import time
 import torch
 
 from loading import build_dit, build_encoder, build_vae
-from lora import inject_lora, inject_lora_te, load_lora_weights, lora_parameters, save_lora
+from lora import (inject_lora, inject_lora_te, load_lora_stage_init, load_lora_weights,
+                  lora_parameters, save_lora)
 from scheduler import get_schedule_for_seqlen
 from train_t2i import (augment_reference_order, edit_training_step,
                         encode_text_with_ref_dropout, t2i_training_step)
@@ -33,6 +34,7 @@ from train_t2i_full_joint_cached import (
     reference_delta_flags,
     render_edit_previews,
     render_previews,
+    cache_edit_ref_geometry,
     resolve_resume_marker,
     rotate_by_glob,
     write_resume_marker,
@@ -67,6 +69,7 @@ def main():
     home_volume_guard(ckpt_dir)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
+    marker = resolve_resume_marker(cfg.paths.resume_from, ckpt_dir)
 
     cache_annotations, _ = load_cache_annotations(cfg.data.cache_annotations)
     train_by_bucket, eval_paths = index_caches(
@@ -81,6 +84,10 @@ def main():
     has_cached_text = "llm_text" in load_sample(probe, device)
     train_te = lc.te_rank > 0                    # TE-LoRA: adapt the Qwen3-VL text encoder (live encode)
     use_live_text = (not has_cached_text) or train_te
+    if cfg.data.edit_vlm_cond and has_cached_text:
+        raise SystemExit(
+            "data.edit_vlm_cond requires a latents-only edit cache; rebuild with "
+            "precache_edit.py --no-cache-text so grounded text is encoded live")
     print(f"LoRA rank={lc.rank} alpha={lc.alpha or lc.rank}: {sum(bucket_weights)} train / "
           f"{len(eval_paths)} eval, buckets={bucket_keys}, live_text={use_live_text}, "
           f"te_lora={train_te} train_dit={lc.train_transformer}", flush=True)
@@ -115,6 +122,13 @@ def main():
     dit.gradient_checkpointing = o.grad_checkpointing or fp8_base
     dit.train()  # enables grad-ckpt; base params stay frozen, only adapters require grad
     print(f"injected {len(adapters)} LoRA adapters", flush=True)
+    if o.compile_blocks:
+        if o.blocks_to_swap:
+            raise SystemExit("optim.compile_blocks and optim.blocks_to_swap cannot be combined")
+        if not lc.train_transformer:
+            raise SystemExit("optim.compile_blocks requires lora.train_transformer=true")
+        ncompiled = dit.compile_blocks(o.compile_mode)
+        print(f"compiled {ncompiled} transformer blocks (mode={o.compile_mode})", flush=True)
     if o.blocks_to_swap:
         # Page the deepest blocks' frozen base CPU<->GPU; LoRA adapters (trainable) stay GPU-resident.
         # Large VRAM saving for >1024 / larger LoRA. Needs grad-ckpt.
@@ -124,10 +138,26 @@ def main():
 
     encoder = build_encoder(cfg, device, dtype, train=False) if use_live_text else None
     te_adapters = {}
+    quant_te = str(o.quantize_te or "").lower()
+    if quant_te not in ("", "fp8"):
+        raise SystemExit(f"unknown optim.quantize_te {o.quantize_te!r}; expected '' or 'fp8'")
+    if quant_te and train_te:
+        raise SystemExit("optim.quantize_te is only supported for a frozen text encoder, not TE-LoRA")
+    if encoder is not None and quant_te == "fp8":
+        from quantize import quantize_frozen_linears_fp8
+        nq = quantize_frozen_linears_fp8(encoder.qwen)
+        print(f"fp8-quantized {nq} frozen Qwen3-VL Linears", flush=True)
     if train_te:                                 # TE-LoRA: frozen Qwen3-VL base + trainable adapters
         te_adapters = inject_lora_te(encoder.qwen, lc.te_rank, lc.alpha)
         encoder.qwen.train()
         print(f"injected {len(te_adapters)} TE-LoRA adapters (Qwen3-VL)", flush=True)
+    if marker is None and cfg.paths.lora_init:
+        load_lora_stage_init(adapters, te_adapters, cfg.paths.lora_init)
+        print(
+            f"LoRA stage warm start: {os.path.basename(cfg.paths.lora_init)} "
+            "(fresh optimizer, scheduler, RNG and step 0)",
+            flush=True,
+        )
     need_preview = bool(lg.sample_every) or args.smoke
     preview_encoder = encoder or (build_encoder(cfg, device, dtype, train=False) if need_preview else None)
     vae = build_vae(cfg, device, dtype) if need_preview else None
@@ -149,7 +179,9 @@ def main():
                                      res=cfg.data.resolution, steps=lg.sample_steps,
                                      guidance=lg.sample_guidance, seed=cfg.runtime.seed,
                                      vlm_cond=cfg.data.edit_vlm_cond,
-                                     vlm_image_size=cfg.data.vlm_image_size)
+                                     vlm_image_size=cfg.data.vlm_image_size,
+                                     edit_ref_geometry=cfg.data.edit_ref_geometry,
+                                     fit_ref_crop_tolerance=cfg.data.fit_ref_crop_tolerance)
             else:
                 render_previews(dit, vae, preview_encoder, DEFAULT_PREVIEWS[: lg.sample_count], out,
                                 res=cfg.data.resolution, steps=lg.sample_steps,
@@ -192,7 +224,9 @@ def main():
                 # so a caption saying "image_2" resolves to refs[1] in both the text encoder and the
                 # DiT stream. Passing only ref_paths[0] leaves multi-reference composition
                 # instructions ungroundable (the encoder never sees the second subject).
-                vlm_imgs = [[_vlm_resize(Image.open(p_), cfg.data.vlm_image_size)
+                vlm_imgs = [[_vlm_resize(
+                                 Image.open(p_), cfg.data.vlm_image_size,
+                                 cfg.data.vlm_image_min_size, rng)
                              for p_ in s["ref_paths"]] for s in samples]
             if vlm_imgs is not None and drop_refs and cfg.data.ref_dropout_prob > 0.0:
                 ref_drop = torch.rand(len(samples)) < cfg.data.ref_dropout_prob
@@ -221,9 +255,16 @@ def main():
                     f"caches are bucketed by target grid only, so multi-reference data requires "
                     f"batch=1 (or bucketing by ref-count)")
             ref_grids = [(r["grid_h"], r["grid_w"]) for r in samples[0]["refs"]]
+            if any([(r["grid_h"], r["grid_w"]) for r in s["refs"]] != ref_grids
+                   for s in samples[1:]):
+                raise RuntimeError(
+                    "batch contains different fitted reference grids; set optim.batch=1 or bucket "
+                    "samples by complete reference layout")
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]
-        return z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags
+        ref_geometry = cache_edit_ref_geometry(samples, cfg.data.edit_ref_geometry)
+        return (z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags,
+                ref_geometry == "fit")
 
     def sample_batch():
         key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
@@ -262,14 +303,15 @@ def main():
                     batches.append(((collate(chunk), vsched), len(chunk)))
 
             def loss_fn(packed, q):
-                (z0, ctx, mask, gh, gw, refs, ref_grids, _, _), vsched = packed
+                (z0, ctx, mask, gh, gw, refs, ref_grids, _, _, center_refs), vsched = packed
                 t = float(vsched(torch.tensor([float(q)])).item())
                 g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
                 if refs is not None:
                     return edit_training_step(dit, z0=z0, refs=refs, ref_grids=ref_grids, context=ctx,
                                               text_mask=mask, grid_h=gh, grid_w=gw, schedule=vsched,
                                               flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
-                                              ref_dropout_prob=0.0, t_override=t, disable_weighting=True)
+                                              ref_dropout_prob=0.0, t_override=t,
+                                              disable_weighting=True, center_refs=center_refs)
                 return t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
                                          schedule=vsched, flow_cfg=fl, generator=g, cfg_dropout_prob=0.0,
                                          t_override=t, disable_weighting=True)
@@ -329,7 +371,6 @@ def main():
 
     # ----- Resume: load adapters + optimizer + scheduler + RNG (+EMA) -----
     start_step = 0
-    marker = resolve_resume_marker(cfg.paths.resume_from, ckpt_dir)
     if marker is not None:
         if adapters:
             load_lora_weights(adapters, marker["_weights_path"])
@@ -354,7 +395,8 @@ def main():
     n_skipped = 0
     for step in range(start_step, steps):
         _state["step"] = step
-        z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags = sample_batch()
+        (z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags,
+         center_refs) = sample_batch()
         schedule = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
                                            max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
                                            max_seq_len=fl.max_image_seq_len)
@@ -370,7 +412,7 @@ def main():
                                       text_mask=mask, grid_h=gh, grid_w=gw, schedule=schedule,
                                       flow_cfg=fl, generator=gen, cfg_dropout_prob=o.cfg_dropout_prob,
                                       ref_dropout_prob=cfg.data.ref_dropout_prob, loss_mask=lmask,
-                                      ref_drop_mask=ref_drop)
+                                      ref_drop_mask=ref_drop, center_refs=center_refs)
         else:
             loss = t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
                                      schedule=schedule, flow_cfg=fl, generator=gen,

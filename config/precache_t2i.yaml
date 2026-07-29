@@ -8,3 +8,5 @@ data:
   json_suffix: .json
   aspect_bucketing: false   # true -> nearest-AR bucket instead of square-squash
   num_buckets: 9
+  edit_ref_geometry: square # precache_edit only: square (full-canvas stretch) | fit (AR-preserving)
+  fit_ref_crop_tolerance: 0.08

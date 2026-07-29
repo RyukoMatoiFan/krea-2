@@ -66,3 +66,18 @@ def quantize_dit_fp8(dit) -> int:
     for mod, name, child in targets:
         setattr(mod, name, Fp8Linear(child))
     return len(targets)
+
+
+def quantize_frozen_linears_fp8(module: nn.Module) -> int:
+    """Replace every frozen descendant ``nn.Linear`` with :class:`Fp8Linear`."""
+    targets = []
+    for parent in module.modules():
+        for name, child in parent.named_children():
+            if isinstance(child, nn.Linear):
+                if any(p.requires_grad for p in child.parameters()):
+                    raise ValueError(
+                        f"cannot FP8-quantize trainable Linear {type(parent).__name__}.{name}")
+                targets.append((parent, name, child))
+    for parent, name, child in targets:
+        setattr(parent, name, Fp8Linear(child))
+    return len(targets)

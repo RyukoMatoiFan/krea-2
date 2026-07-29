@@ -7,8 +7,8 @@ Diffusion Transformers"* (arXiv:2512.03673). Self-contained on torch: no torchao
 Kronecker powers of the 4x4 regular Hadamard, orthonormal and symmetric, hence its own inverse. The
 standard Hadamard has an all-ones row that concentrates a block's mean into one coordinate; the
 regular one has constant row sums instead, so it smooths outliers along rows and columns
-symmetrically. That is what makes a single scale per row safe: outliers are spread rather than
-clipped, which is the failure mode coarse per-row scaling otherwise runs into.
+symmetrically. The resulting distribution lets a single scale per row represent the rotated values
+with less clipping.
 
 The rotation costs nothing in accuracy: ``R`` is folded into the weight once, offline, and applied to
 the activation at runtime, so it cancels inside the matmul (``x R (W R)^T = x W^T``). It is

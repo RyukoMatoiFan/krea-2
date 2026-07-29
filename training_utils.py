@@ -52,6 +52,7 @@ def timestep_weight(
     "sigma_sqrt" -> 1 / sigma^2 (SD3 loss weighting). Strongly up-weights low-noise
                     (low-t) timesteps.
     "cosmap"     -> 2 / (pi * (1 - 2*sigma + 2*sigma^2)) (SD3 cosine-map loss weighting).
+    "weighted"   -> empirical 1,000-step curve with uniform, unshifted timestep sampling.
   Returns weights with the same shape as t (non-negative).
   """
   if scheme == "uniform":
@@ -69,6 +70,9 @@ def timestep_weight(
     sigma = t.clamp(0.0, 1.0)  # krea2: noise fraction == t
     bot = 1.0 - 2.0 * sigma + 2.0 * sigma ** 2  # >= 0.5, never zero
     return 2.0 / (math.pi * bot)
+  if scheme == "weighted":
+    from timestep_weights import empirical_timestep_weight
+    return empirical_timestep_weight(t)
   raise ValueError(f"unknown timestep weighting scheme: {scheme!r}")
 
 

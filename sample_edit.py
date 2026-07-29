@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file
 
+from edit_geometry import prepare_reference_image
 from loading import build_dit, build_encoder, build_vae
 from lora import load_lora
 from precache_t2i import encode_latent, images_to_tensor, patchify
@@ -26,10 +27,13 @@ from train_t2i import build_pos_mask
 from training_config import apply_runtime, dtype_of, load_config
 
 
-def _vlm_resize(im, max_side):
+def _vlm_resize(im, max_side, min_side=0, rng=None):
     """Downscale (keep aspect) so the longest side <= ``max_side`` before the Qwen3-VL vision tower,
-    bounding VLM cost by shrinking the reference image ahead of encoding."""
+    optionally jittering the cap uniformly during training."""
     im = im.convert("RGB")
+    if min_side and min_side < max_side:
+        import random
+        max_side = (rng or random).randint(int(min_side), int(max_side))
     w, h = im.size
     s = max(w, h)
     if s > max_side:
@@ -41,7 +45,8 @@ def _vlm_resize(im, max_side):
 def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", device="cuda",
                 dtype=torch.bfloat16, width=1024, height=1024, steps=28, guidance=4.5, seed=0,
                 minres=256, maxres=1280, y1=0.5, y2=1.15, mu=None,
-                ref_t0=True, vlm_cond=False, vlm_image_size=384, uncond="zero"):
+                ref_t0=True, vlm_cond=False, vlm_image_size=384, uncond="zero",
+                edit_ref_geometry="square", fit_ref_crop_tolerance=0.08):
     """Denoise a single target conditioned on a text prompt + clean reference image(s).
 
     ``ref_t0`` gives the clean reference tokens a t=0 modulation in the DiT (matches training).
@@ -52,13 +57,17 @@ def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", 
     width, height = roundup(width, align, "width"), roundup(height, align, "height")
     glat_h, glat_w = height // align, width // align  # target latent grid (in patches)
 
-    # Clean reference tokens (square-resized to the target size, matching precache_edit).
+    # Clean reference tokens, using the same geometry contract as edit precaching.
     ref_tokens, ref_grids = [], []
     for im in ref_images:
-        x = images_to_tensor(im, width, height, dtype).to(device)  # (1,3,H,W) in [-1,1]
+        prepared = prepare_reference_image(
+            im, (width, height), geometry=edit_ref_geometry, align=align,
+            crop_tolerance=fit_ref_crop_tolerance)
+        x = images_to_tensor(
+            prepared, prepared.width, prepared.height, dtype).to(device)  # (1,3,H,W) in [-1,1]
         z = encode_latent(vae, x)                                   # (1,16,h,w) normalized
         ref_tokens.append(patchify(z, patch).to(dtype))             # (1, n_ref, 64)
-        ref_grids.append((glat_h, glat_w))
+        ref_grids.append((prepared.height // align, prepared.width // align))
 
     # Target noise (patchified latent), seeded.
     noise = torch.randn(1, vae.channels, height // vae.compression, width // vae.compression,
@@ -77,7 +86,9 @@ def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", 
 
     cfg = guidance > 0
     txt, txtmask = encoder([prompt], images=vlm_imgs)
-    pos, mask = build_pos_mask(glat_h, glat_w, txtmask, ref_grids=ref_grids)
+    center_refs = edit_ref_geometry == "fit"
+    pos, mask = build_pos_mask(
+        glat_h, glat_w, txtmask, ref_grids=ref_grids, center_refs=center_refs)
     if cfg:
         if negative_prompt:
             # Explicit negative prompt: encode it (with the same VLM images, so only the TEXT differs).
@@ -92,7 +103,8 @@ def edit_sample(model, vae, encoder, prompt, ref_images, *, negative_prompt="", 
             # the unconditional the model learned; guidance against it subtracts an out-of-
             # distribution condition. Reuse the conditional's shape/mask and zero the content.
             untxt, untxtmask = torch.zeros_like(txt), txtmask
-        unpos, unmask = build_pos_mask(glat_h, glat_w, untxtmask, ref_grids=ref_grids)
+        unpos, unmask = build_pos_mask(
+            glat_h, glat_w, untxtmask, ref_grids=ref_grids, center_refs=center_refs)
 
     # mu-shift uses the TARGET image-token count (matches get_schedule_for_seqlen in training).
     x1 = (minres // align) ** 2
@@ -172,7 +184,9 @@ def main():
                       steps=args.steps, guidance=args.guidance, seed=args.seed,
                       mu=args.mu, y1=args.y1, y2=args.y2,
                       ref_t0=not args.no_ref_t0, vlm_cond=args.vlm_cond,
-                      vlm_image_size=args.vlm_image_size)
+                      vlm_image_size=args.vlm_image_size,
+                      edit_ref_geometry=cfg.data.edit_ref_geometry,
+                      fit_ref_crop_tolerance=cfg.data.fit_ref_crop_tolerance)
     img.save(args.out)
     print("saved", args.out, flush=True)
 

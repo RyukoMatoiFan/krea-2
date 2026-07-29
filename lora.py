@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -503,6 +504,31 @@ def load_lora_weights(adapters: dict, path: str, *, key_prefix: str = "diffusion
             for pname, p in tensors.items():
                 p.copy_(saved[pname].to(p.dtype))
     return missing
+
+
+def load_lora_stage_init(adapters: dict, te_adapters: dict, path: str) -> None:
+    """Load a weights-only stage initialization without restoring training state."""
+    if not path:
+        return
+    if not adapters:
+        raise SystemExit("paths.lora_init is set, but lora.train_transformer is false")
+    if not os.path.isfile(path):
+        raise SystemExit(f"paths.lora_init does not exist: {path}")
+    missing = load_lora_weights(adapters, path)
+    if missing:
+        raise SystemExit(
+            f"paths.lora_init is missing {missing}/{len(adapters)} DiT adapters; "
+            "rank, variant, or target modules do not match")
+    if te_adapters:
+        root, ext = os.path.splitext(path)
+        te_path = f"{root}.te{ext or '.safetensors'}"
+        if not os.path.isfile(te_path):
+            raise SystemExit(
+                f"TE-LoRA is enabled, but the paired stage initialization is missing: {te_path}")
+        te_missing = load_lora_weights(te_adapters, te_path, key_prefix="text_encoder")
+        if te_missing:
+            raise SystemExit(
+                f"paired TE initialization is missing {te_missing}/{len(te_adapters)} adapters")
 
 
 def load_lora(dit, path: str) -> dict:

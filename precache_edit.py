@@ -32,9 +32,11 @@ import torch
 from PIL import Image
 
 from constants import PATCH_SIZE
+from edit_geometry import prepare_reference_image
 from loading import build_encoder, build_vae
 from precache_t2i import ALIGN, atomic_save, encode_latent, images_to_tensor, patchify, round_to
 from training_config import apply_runtime, dtype_of, load_config
+from training_utils import aspect_buckets, nearest_bucket
 
 _GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -60,6 +62,11 @@ def _payload_sig(
     system_prompt: str = "",
     encoder_id: str = "",
     vae_id: str = "",
+    aspect_bucketing: bool = False,
+    bucket_pixels: int = 0,
+    num_buckets: int = 9,
+    edit_ref_geometry: str = "square",
+    fit_ref_crop_tolerance: float = 0.08,
 ) -> str:
     """Fingerprint of everything a cached payload depends on.
 
@@ -83,7 +90,11 @@ def _payload_sig(
         h.update(_stat_id(r).encode("utf-8"))
     h.update(b"\x01")
     h.update((caption or "").encode("utf-8"))
-    h.update(f"|res={int(res)}|text={bool(cache_text)}".encode("utf-8"))
+    h.update(
+        f"|res={int(res)}|text={bool(cache_text)}|aspect={bool(aspect_bucketing)}"
+        f"|bucket_pixels={int(bucket_pixels)}|num_buckets={int(num_buckets)}"
+        f"|ref_geometry={edit_ref_geometry}|fit_tol={float(fit_ref_crop_tolerance):.8g}"
+        .encode("utf-8"))
     h.update(f"|sys={system_prompt}|enc={encoder_id}|vae={vae_id}".encode("utf-8"))
     if annotations:
         h.update(b"|annotations=")
@@ -124,14 +135,12 @@ def _annotations_of(line: dict) -> dict:
     return out
 
 
-def _encode_image(vae, path: str, res: int, device, dtype):
-    """RGB image -> (normalized, patchified) latent tokens + latent grid (gh, gw). Square-resized."""
-    img = Image.open(path)
-    side = round_to(res, ALIGN)
-    x = images_to_tensor(img, side, side, dtype).to(device)
+def _encode_image(vae, image: Image.Image, width: int, height: int, device, dtype):
+    """RGB image -> normalized, patchified latent tokens and its latent grid."""
+    x = images_to_tensor(image, width, height, dtype).to(device)
     z = encode_latent(vae, x)                                     # (1,16,H_lat,W_lat)
     tokens = patchify(z, PATCH_SIZE)[0].to(torch.bfloat16).cpu()  # (gh*gw, 64)
-    return tokens, side // ALIGN, side // ALIGN
+    return tokens, height // ALIGN, width // ALIGN
 
 
 def main() -> None:
@@ -150,6 +159,10 @@ def main() -> None:
     apply_runtime(cfg)
     device, dtype = cfg.runtime.device, dtype_of(cfg)
     res = cfg.data.resolution
+    buckets = None
+    if cfg.data.aspect_bucketing:
+        buckets = aspect_buckets(
+            cfg.data.bucket_pixels or res ** 2, divisor=ALIGN, num=cfg.data.num_buckets)
     cache_dir = cfg.paths.cache_dir
     os.makedirs(cache_dir, exist_ok=True)
     root = args.data_root or os.path.dirname(os.path.abspath(args.manifest))
@@ -165,6 +178,7 @@ def main() -> None:
         return p if os.path.isabs(p) else os.path.join(root, p)
 
     print(f"examples={len(lines)} shard={args.shard}/{args.num_shards} res={res} "
+          f"buckets={bool(buckets)} ref_geometry={cfg.data.edit_ref_geometry} "
           f"cache_text={args.cache_text} -> {cache_dir}", flush=True)
     vae = build_vae(cfg, device, dtype)
     encoder = build_encoder(cfg, device, dtype) if args.cache_text else None
@@ -192,7 +206,12 @@ def main() -> None:
         sig = _payload_sig(tgt, refs, caption, res, args.cache_text,
                            annotations=annotations,
                            system_prompt=getattr(cfg.data, "text_system_prompt", ""),
-                           encoder_id=cfg.paths.text_encoder_id, vae_id=cfg.paths.vae_id)
+                           encoder_id=cfg.paths.text_encoder_id, vae_id=cfg.paths.vae_id,
+                           aspect_bucketing=cfg.data.aspect_bucketing,
+                           bucket_pixels=cfg.data.bucket_pixels,
+                           num_buckets=cfg.data.num_buckets,
+                           edit_ref_geometry=cfg.data.edit_ref_geometry,
+                           fit_ref_crop_tolerance=cfg.data.fit_ref_crop_tolerance)
         out = os.path.join(cache_dir, f"{idx:06d}.pt")
         if os.path.exists(out):  # content-aware skip
             try:
@@ -209,10 +228,25 @@ def main() -> None:
                 pass
 
         try:
-            z_tgt, gh, gw = _encode_image(vae, tgt, res, device, dtype)
+            target_image = Image.open(tgt).convert("RGB")
+            if buckets is not None:
+                target_h, target_w = nearest_bucket(
+                    target_image.width, target_image.height, buckets)
+            else:
+                target_h = target_w = round_to(res, ALIGN)
+            z_tgt, gh, gw = _encode_image(
+                vae, target_image, target_w, target_h, device, dtype)
             ref_payload = []
             for r in refs:
-                rt, rgh, rgw = _encode_image(vae, r, res, device, dtype)
+                ref_image = prepare_reference_image(
+                    Image.open(r),
+                    (target_w, target_h),
+                    geometry=cfg.data.edit_ref_geometry,
+                    align=ALIGN,
+                    crop_tolerance=cfg.data.fit_ref_crop_tolerance,
+                )
+                rt, rgh, rgw = _encode_image(
+                    vae, ref_image, ref_image.width, ref_image.height, device, dtype)
                 ref_payload.append({"tokens": rt, "grid_h": rgh, "grid_w": rgw})
         except Exception as e:
             print(f"  WARN encode failed idx={idx} ({tgt}): {type(e).__name__} {e}; skipping", flush=True)
@@ -222,6 +256,7 @@ def main() -> None:
         payload = {"z_tgt": z_tgt, "grid_h": gh, "grid_w": gw, "idx": idx,
                    "caption": caption, "src": os.path.abspath(tgt), "refs": ref_payload,
                    "ref_paths": [os.path.abspath(r) for r in refs],  # source pixels for optional VLM cond
+                   "edit_ref_geometry": cfg.data.edit_ref_geometry,
                    "sig": sig}  # fingerprint of everything the payload depends on (see the skip check)
         payload.update(annotations)
         if args.cache_text:

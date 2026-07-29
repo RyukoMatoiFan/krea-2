@@ -50,7 +50,9 @@ Throughput switches, all off by default and none changing the objective:
 | `data.skip_ref_cross_attention: true` | multi-reference only: block-sparse mask dropping attention between *different* references (exact — those blocks carry no meaning) |
 
 Flow-matching convention (see `constants.py`): **t=1 noise, t=0 data**, `x_t = t·noise + (1-t)·x0`,
-velocity target `v = noise - x0`. Timesteps use Krea's resolution-aware `mu` shift (`scheduler.py`).
+velocity target `v = noise - x0`. Timesteps normally use Krea's resolution-aware `mu` shift
+(`scheduler.py`). `flow.timestep_weighting: weighted` selects the empirical 1,000-step recipe:
+uniform unshifted timestep sampling plus its mean-one lookup-table loss weights.
 
 Reference-conditioned cache behaviour is declared, never inferred from filenames. `precache_edit.py`
 manifest rows accept two optional fields: `reference_delta_mask: true` (first reference is spatially
@@ -93,6 +95,10 @@ For `oft` / `boft`, `lora.rank` is the **number of blocks**: larger means *fewer
 variant except `lora` changes the rank/parameter relationship, so compare them at equal parameter
 count, not equal rank.
 
+For a fresh higher-resolution stage, set `paths.lora_init` to an earlier LoRA checkpoint. This loads
+adapter weights only and starts at step 0 with a new optimizer, LR schedule, and RNG. A normal
+`paths.resume_from` takes precedence and restores the complete interrupted training state instead.
+
 ## 2c. Concept sliders
 
 `train_slider.py` trains a bidirectional attribute LoRA with **no dataset**: it regresses a ±adapter
@@ -127,11 +133,15 @@ Three independent levers. They compose, and none changes the training objective.
 | `optim.blocks_to_swap: N` | parks the N deepest blocks on CPU, pages each in for its forward/backward | gradient checkpointing; costs host↔device copies |
 | `optim.quantize_base: fp8` | frozen attn+MLP weights as e4m3 + per-row scale, dequantized per forward | gradient checkpointing (forced on) |
 | `optim.quantize_base: int8` | the same weights rotated and stored as int8; the **matmul runs on int8 tensor cores**, so compute drops too | int8 tensor cores (Ampere+); incompatible with `variant: dora` |
+| `optim.quantize_te: fp8` | frozen live Qwen3-VL linear weights as e4m3 + per-row scale | frozen TE only; incompatible with TE full fine-tuning and TE-LoRA |
+| `optim.compile_blocks: true` | compiles each DiT block after adapter injection | LoRA transformer training; incompatible with block swap |
 
 ```bash
 KREA2_OPTIM__BLOCKS_TO_SWAP=14 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
 KREA2_OPTIM__QUANTIZE_BASE=fp8 KREA2_OPTIM__BLOCKS_TO_SWAP=14 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
 KREA2_OPTIM__QUANTIZE_BASE=int8 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
+KREA2_OPTIM__QUANTIZE_TE=fp8 python train_t2i_lora_cached.py --config config/t2i_lora.yaml
+KREA2_OPTIM__COMPILE_BLOCKS=true python train_t2i_lora_cached.py --config config/t2i_lora.yaml
 ```
 
 - `quantize_base` is LoRA-only. Block swap also runs in full-FT, paging trainable weights.
@@ -168,6 +178,21 @@ python sample_edit.py --config config/t2i_lora.yaml --lora runs/r/ckpts/lora_fin
 Manifest line: `{"target": "...", "refs": ["..."], "caption"|"instruction": "..."}`. Edit training needs
 paired (source→target, instruction) data; structural edits (object removal, background replacement)
 favour full fine-tune over LoRA.
+
+Edit geometry and grounded-text controls:
+
+| option | behavior |
+|---|---|
+| `data.aspect_bucketing: true` | buckets edit targets by native aspect ratio during precache |
+| `data.edit_ref_geometry: fit` | fits each reference inside the target grid without aspect squash and fractionally centers its RoPE coordinates |
+| `data.fit_ref_crop_tolerance: 0.08` | near-matching reference aspect ratios within 8% minimally crop to fill the target |
+| `data.edit_vlm_cond: true` | sends the original reference pixels through Qwen3-VL as well as the VAE-token path |
+| `data.vlm_image_size: 768` + `data.vlm_image_min_size: 384` | jitters the Qwen3-VL grounding cap per training step; previews and inference remain fixed at the maximum |
+
+`edit_vlm_cond` requires `precache_edit.py --no-cache-text`; a cached text tensor cannot represent
+per-step image grounding. Fit caches record their geometry and are refused if the training config
+does not match. Fitted references with different token grids require `optim.batch: 1`; use
+`optim.accum` for a larger effective batch.
 
 ## 5. Style transfer
 

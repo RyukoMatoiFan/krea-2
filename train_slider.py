@@ -108,7 +108,7 @@ def main():
     print(f"[slider] (+)'{s.positive[:34]}' (-)'{s.negative[:34]}' anchor='{s.anchor or '<uncond>'}' "
           f"eta={s.eta} late_frac={s.late_frac}", flush=True)
 
-    if low_vram:                       # the training loop needs no encoder (text pre-encoded); free ~8GB
+    if low_vram:                       # text is pre-encoded, so the training loop can release the encoder
         import gc
         encoder = None
         gc.collect()
