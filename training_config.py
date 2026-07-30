@@ -232,6 +232,26 @@ class SliderConfig:
 
 
 @dataclass
+class DopConfig:
+  # Differential output preservation (LoRA trainer only). Each step also asks: on a PRIOR prompt the
+  # training set is not about, does the adapted model still predict what the frozen base predicts?
+  # The target is the base's own prediction with the adapters switched off, on the same noised latent
+  # and timestep -- so no regularisation image set is needed and the prior is exact rather than
+  # approximated by generated images. Cost is roughly 2x the step (one extra forward with grad, one
+  # without), and the term is exactly 0 at step 0.
+  enabled: bool = False
+  weight: float = 1.0         # multiplier on the preservation term (ai-toolkit's DOP multiplier)
+  prompt: str = ""            # fixed class/prior prompt, e.g. "a photo of a dog". Encoded ONCE at
+                              # startup (cheap). Mutually exclusive with `trigger`.
+  trigger: str = ""           # instead of a fixed prompt, build the prior per sample by removing this
+                              # trigger word from the caption -- the prior is then the same sentence
+                              # WITHOUT the concept being taught, which is the tighter constraint but
+                              # costs a live text encode of a second prompt every step.
+  every: int = 1              # compute the term every N steps (>1 amortises the cost, at the price of
+                              # an unevenly applied regulariser -- prefer lowering `weight`)
+
+
+@dataclass
 class TrainConfig:
   paths: PathsConfig = field(default_factory=PathsConfig)
   runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -241,6 +261,7 @@ class TrainConfig:
   flow: FlowConfig = field(default_factory=FlowConfig)
   logging: LoggingConfig = field(default_factory=LoggingConfig)
   slider: SliderConfig = field(default_factory=SliderConfig)
+  dop: DopConfig = field(default_factory=DopConfig)
 
 
 # Section name -> dataclass type. Drives merging and env-override casting.
@@ -253,6 +274,7 @@ _SECTIONS = {
   "flow": FlowConfig,
   "logging": LoggingConfig,
   "slider": SliderConfig,
+  "dop": DopConfig,
 }
 
 

@@ -6,9 +6,18 @@ paths:
 lora:
   rank: 32
   alpha: 32                # null -> defaults to rank
-  variant: lora
+  variant: lora            # lora | dora | loha | lokr | oft | boft  (loha/lokr = LyCORIS;
+                           # for oft/boft `rank` is the BLOCK COUNT, so larger = fewer parameters)
   target_txtfusion: true   # also adapt the text-fusion stage Linears
   target_txtmlp: true      # also adapt the text MLP projection Linears
+dop:
+  # Differential output preservation: hold the adapted model's prediction on a PRIOR prompt onto the
+  # frozen base's own prediction for it. Needs no regularisation images. Costs ~2x per step.
+  enabled: false
+  weight: 1.0
+  prompt: ""               # fixed prior prompt, e.g. "a photo of a dog" (encoded once)
+  trigger: ""              # OR strip this trigger word from each caption to form the prior
+  every: 1
 optim:
   lr: 1.0e-4
   steps: 3000

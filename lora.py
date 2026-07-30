@@ -4,12 +4,15 @@ Custom (not PEFT) so saved adapters use the widely-consumed key convention
 ``diffusion_model.<module path>.lora_{A,B}.weight`` -> a LoRA trained on **Raw** loads directly on
 **Turbo** in ComfyUI (Krea's recommended "train on Raw, run on Turbo").
 
-Five update parameterisations are available via ``variant``: ``lora`` (low-rank product), ``dora``
+Six update parameterisations are available via ``variant``: ``lora`` (low-rank product), ``dora``
 (magnitude/direction decomposition), ``loha`` (Hadamard product of two low-rank pairs), ``lokr``
 (Kronecker product), ``oft`` (orthogonal rotation via the Cayley transform) and ``boft`` (the same
-rotation factorised into butterfly stages). The first four ADD to the weight; the last two ROTATE it,
-preserving neuron angles and norms by construction. They share one interface, so scaling, saving,
-loading and parameter collection are variant-agnostic.
+rotation factorised into butterfly stages). ``loha``/``lokr`` are the LyCORIS algorithms. The first
+four ADD to the weight; the last two ROTATE it, preserving neuron angles and norms by construction.
+They share one interface, so scaling, saving, loading, EMA and parameter collection are
+variant-agnostic -- anything that names ``lora_A``/``lora_B`` by hand silently or loudly breaks the
+four variants that have no such tensors, so go through :func:`adapter_tensors`,
+:func:`ema_named_tensors` and :func:`lora_spec_from_state` instead.
 
 Targeted Linears per DiT/text-fusion block (names from mmdit.py): the attention q/k/v/out projections
 and the SwiGLU MLP gate/up/down. The text MLP projection stage is also adapted by default. The base
@@ -328,12 +331,50 @@ def _kron_split(dim: int, factor: int) -> int:
 VARIANTS = {"lora": LoRALinear, "dora": DoRALinear, "loha": LoHaLinear,
             "lokr": LoKrLinear, "oft": OFTLinear, "boft": BOFTLinear}
 
+# Exact-type reverse map (not isinstance: DoRA subclasses LoRA, LoHa subclasses LoRA).
+_VARIANT_BY_CLS = {cls: name for name, cls in VARIANTS.items()}
+
 
 def _adapter_cls(variant: str):
     try:
         return VARIANTS[variant]
     except KeyError:
         raise SystemExit(f"unknown lora.variant {variant!r}; expected one of {sorted(VARIANTS)}")
+
+
+def variant_of(adapters) -> str:
+    """The variant name of an injected adapter (or of the first module in a {name: module} dict).
+
+    Read off the live modules rather than passed in by the caller, so a saved file can never claim a
+    variant the weights in it do not have.
+    """
+    if isinstance(adapters, dict):
+        if not adapters:
+            return "lora"
+        adapters = next(iter(adapters.values()))
+    return _VARIANT_BY_CLS.get(type(adapters), "lora")
+
+
+def adapter_modules(model: nn.Module) -> list:
+    """Every injected adapter in ``model`` -- empty if none were injected."""
+    return [m for m in model.modules() if isinstance(m, AdapterLinear)]
+
+
+def ema_named_tensors(pools: dict) -> dict:
+    """``{tag: {name: adapter}}`` -> ``{f"{tag}.{name}.{tensor}": live tensor}`` for :class:`EmaModel`.
+
+    Variant-agnostic on purpose. Naming the tensors by hand works only for plain LoRA: LoKr, OFT and
+    BOFT have no ``lora_A``/``lora_B`` at all (so hand-naming raises), while DoRA's magnitude and
+    LoHa's second pair simply would not be averaged -- an EMA silently covering half of an adapter is
+    worse than none, since the saved EMA weights are then an inconsistent mixture of averaged and
+    instantaneous tensors. Plain-LoRA keys are unchanged, so existing EMA resume state still loads.
+    """
+    named = {}
+    for tag, pool in pools.items():
+        for name, m in pool.items():
+            for pname, p in adapter_tensors(m).items():
+                named[f"{tag}.{name}.{pname}"] = p
+    return named
 
 
 @contextlib.contextmanager
@@ -430,13 +471,15 @@ def lora_parameters(adapters: dict) -> list:
 QWEN_TE_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
-def inject_lora_te(qwen, rank: int, alpha: float | None = None, *, targets=QWEN_TE_TARGETS) -> dict:
-    """Wrap the Qwen3-VL **language-model** Linear projections with :class:`LoRALinear` (TE-LoRA).
+def inject_lora_te(qwen, rank: int, alpha: float | None = None, *, targets=QWEN_TE_TARGETS,
+                   variant: str = "lora") -> dict:
+    """Wrap the Qwen3-VL **language-model** Linear projections with the ``variant`` adapter (TE-LoRA).
 
     The base Qwen3-VL stays frozen; only the adapters train. The vision tower (``visual``/``vision``)
     is left untouched -- we adapt text understanding, not image features. Robust to layer-path
-    differences across transformers versions (matches by leaf name). Returns {module path: LoRALinear}.
+    differences across transformers versions (matches by leaf name). Returns {module path: adapter}.
     """
+    cls = _adapter_cls(variant)
     alpha = alpha if alpha is not None else float(rank)
     qwen.requires_grad_(False)
     adapters: dict[str, LoRALinear] = {}
@@ -446,7 +489,7 @@ def inject_lora_te(qwen, rank: int, alpha: float | None = None, *, targets=QWEN_
         if "visual" in name or "vision" in name:
             continue
         parent = qwen.get_submodule(name.rsplit(".", 1)[0]) if "." in name else qwen
-        lora = LoRALinear(module, rank, alpha)
+        lora = cls(module, rank, alpha)
         setattr(parent, name.split(".")[-1], lora)
         adapters[name] = lora
     if not adapters:
@@ -461,16 +504,25 @@ def save_lora(adapters: dict, path: str, *, rank: int, alpha: float, metadata: d
     ``key_prefix`` is ``diffusion_model`` for DiT LoRA (the convention ComfyUI loads, so a LoRA
     trained on Raw runs on Turbo)
     and ``text_encoder`` for TE-LoRA (Qwen3-VL adapters).
+
+    ``lora_A``/``lora_B`` are written bf16 (the consumed convention); every other tensor is written
+    fp32. Those others are not small deltas around zero: DoRA's ``dora_m`` holds the base weight's
+    own column norms, so rounding it to bf16 perturbs the effective weight by ~4e-3 relative on
+    every save/resume cycle -- a real quality change, not a rounding detail.
     """
     sd = {}
     for name, m in adapters.items():
         # Keyed by the adapter's own parameter names, so plain LoRA still writes exactly
         # lora_A.weight / lora_B.weight while the variants carry their extra factors alongside.
         for pname, p in adapter_tensors(m).items():
-            sd[f"{key_prefix}.{name}.{pname}.weight"] = p.detach().to(torch.bfloat16).cpu().contiguous()
+            dt = torch.bfloat16 if pname in ("lora_A", "lora_B") else torch.float32
+            sd[f"{key_prefix}.{name}.{pname}.weight"] = p.detach().to(dt).cpu().contiguous()
     meta = {"format": "krea2-lora", "rank": str(rank), "alpha": str(alpha)}
     if metadata:
         meta.update({k: str(v) for k, v in metadata.items()})
+    # Derived last: the file's declared variant is whatever the saved modules actually are, so a
+    # caller passing a stale metadata["variant"] cannot mislabel a checkpoint.
+    meta["variant"] = variant_of(adapters)
     tmp = path + ".tmp"
     save_file(sd, tmp, metadata=meta)
     import os
@@ -531,29 +583,88 @@ def load_lora_stage_init(adapters: dict, te_adapters: dict, path: str) -> None:
                 f"paired TE initialization is missing {te_missing}/{len(te_adapters)} adapters")
 
 
+def lora_spec_from_state(sd: dict, meta: dict | None = None, *,
+                         key_prefix: str = "diffusion_model") -> dict:
+    """Recover everything :func:`inject_lora` needs from a saved state dict (+ safetensors metadata).
+
+    Returns ``{variant, rank, alpha, include_txtfusion, include_txtmlp}``.
+
+    Metadata is authoritative when present (our own saves write ``variant``/``rank``/``alpha``), and
+    the key shapes are the fallback for files that predate it. ``alpha`` matters: the adapter's effect
+    is scaled by ``alpha/rank``, so defaulting it to ``rank`` silently renders every LoRA trained with
+    a non-default alpha at the wrong strength.
+    """
+    meta = meta or {}
+    tensors: dict[str, torch.Tensor] = {}
+    include_txtfusion = include_txtmlp = False
+    for k, v in sd.items():
+        body = k[len(key_prefix) + 1:] if k.startswith(key_prefix + ".") else k
+        name, pname = body.rsplit(".", 2)[0], body.rsplit(".", 2)[-2]
+        if "txtfusion" in name:
+            include_txtfusion = True
+        if "txtmlp" in name:
+            include_txtmlp = True
+        tensors.setdefault(pname, v)
+
+    variant = meta.get("variant")
+    if variant not in VARIANTS:
+        # Infer from which tensors are present. BOFT and OFT share the parameter NAME and are told
+        # apart only by its rank: (n_factors, n_blocks, blk, blk) vs (n_blocks, blk, blk).
+        if "oft_Q" in tensors:
+            variant = "boft" if tensors["oft_Q"].dim() == 4 else "oft"
+        elif "lokr_A" in tensors:
+            variant = "lokr"
+        elif "loha_A2" in tensors:
+            variant = "loha"
+        elif "dora_m" in tensors:
+            variant = "dora"
+        elif "lora_A" in tensors:
+            variant = "lora"
+        else:
+            raise ValueError(f"no recognisable adapter tensors found (keys: {sorted(tensors)})")
+
+    rank = None
+    if str(meta.get("rank", "")).isdigit():
+        rank = int(meta["rank"])
+    if rank is None:
+        # For oft/boft `rank` is the block COUNT and for lokr the inner rank of the B factor, so each
+        # variant reads it from a different axis of a different tensor.
+        if variant in ("oft", "boft"):
+            q = tensors["oft_Q"]
+            rank = int(q.shape[1] if q.dim() == 4 else q.shape[0])
+        elif variant == "lokr":
+            rank = int(tensors["lokr_B1"].shape[1])
+        elif "lora_A" in tensors:
+            rank = int(tensors["lora_A"].shape[0])
+        else:
+            raise ValueError(f"cannot infer rank for variant {variant!r} (keys: {sorted(tensors)})")
+    try:
+        alpha = float(meta["alpha"])
+    except (KeyError, TypeError, ValueError):
+        alpha = float(rank)
+    return {"variant": variant, "rank": rank, "alpha": alpha,
+            "include_txtfusion": include_txtfusion, "include_txtmlp": include_txtmlp}
+
+
 def load_lora(dit, path: str) -> dict:
     """Inject adapters matching a saved LoRA and load its weights (frozen, for inference).
 
-    Infers rank + target set + whether text-side stages were adapted from the saved keys.
+    Infers the variant, rank, alpha and target set from the file, so every variant this module can
+    train can also be sampled -- OFT/BOFT/LoKr adapters carry no ``lora_A`` at all.
     """
+    from safetensors import safe_open
     from safetensors.torch import load_file
 
     sd = load_file(path)
-    rank = None
-    has_txtfusion = False
-    has_txtmlp = False
-    for k, v in sd.items():
-        name = k[len("diffusion_model."):].rsplit(".lora_", 1)[0]
-        if "txtfusion" in name:
-            has_txtfusion = True
-        if "txtmlp" in name:
-            has_txtmlp = True
-        if k.endswith("lora_A.weight") and rank is None:
-            rank = v.shape[0]
-    if rank is None:
-        raise ValueError(f"no lora_A weights found in {path}")
-    adapters = inject_lora(dit, rank, include_txtfusion=has_txtfusion, include_txtmlp=has_txtmlp)
+    with safe_open(path, framework="pt") as f:
+        meta = f.metadata() or {}
+    spec = lora_spec_from_state(sd, meta)
+    adapters = inject_lora(dit, spec["rank"], spec["alpha"], variant=spec["variant"],
+                           include_txtfusion=spec["include_txtfusion"],
+                           include_txtmlp=spec["include_txtmlp"])
     missing = load_lora_weights(adapters, path)
     if missing:
         print(f"[load_lora] warning: {missing} injected adapters had no saved weights")
+    print(f"[load_lora] {os.path.basename(path)}: variant={spec['variant']} rank={spec['rank']} "
+          f"alpha={spec['alpha']:g} ({len(adapters)} adapters)")
     return adapters

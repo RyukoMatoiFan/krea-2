@@ -91,13 +91,67 @@ runtime scale knob, and are exact no-ops at step 0.
 | `oft` | `W' = R W`, `R` block-diagonal orthogonal (Cayley) | preserves neuron angles and norms by construction |
 | `boft` | `R` factorised into butterfly stages | same property, parameter cost linear in the width |
 
-For `oft` / `boft`, `lora.rank` is the **number of blocks**: larger means *fewer* parameters. Every
-variant except `lora` changes the rank/parameter relationship, so compare them at equal parameter
-count, not equal rank.
+`loha` and `lokr` are the LyCORIS algorithms. For `oft` / `boft`, `lora.rank` is the **number of
+blocks**: larger means *fewer* parameters. Every variant except `lora` changes the rank/parameter
+relationship, so compare them at equal parameter count, not equal rank.
+
+A *small* `rank` is the expensive end for `oft`/`boft`, which is the opposite of the LoRA intuition:
+few blocks means wide blocks, and the rotation costs `tokens × out_features × block_width`, in both
+time and peak memory. A low block count can therefore make the rotation, not the model, the dominant
+consumer — while a high one keeps it marginal. Start high (32–64) and only lower it if the adapter is
+underfitting.
+
+The variant also applies to TE-LoRA (`lora.te_rank`, both trainers) and to the concept slider. It is
+recorded in the saved file's metadata and read back on load, so `sample.py --lora`,
+`sample_edit.py`, `eval_t2i.py` and `slider_render.py` reconstruct the right adapter — including
+`alpha`, which scales the adapter's effect and is not assumed equal to `rank`. `optim.use_ema`
+averages every tensor of whichever variant is active.
 
 For a fresh higher-resolution stage, set `paths.lora_init` to an earlier LoRA checkpoint. This loads
 adapter weights only and starts at step 0 with a new optimizer, LR schedule, and RNG. A normal
 `paths.resume_from` takes precedence and restores the complete interrupted training state instead.
+
+### Differential output preservation
+
+A LoRA taught a new concept also drags everything near it: the trigger bleeds into unrelated prompts
+and the class it belongs to collapses toward the training set. The classic fix is a regularisation
+image set — generate hundreds of "a photo of a dog" images and train on them alongside. Differential
+output preservation removes that step. Every step it also asks the model to predict a **prior prompt**,
+and supervises that prediction against **the frozen base's own prediction of the same prompt** —
+obtained by running the same forward with the adapters switched off (`lora_disabled`). The prior is
+therefore exact rather than approximated by generated images, and the term is **identically zero at
+step 0**, growing only as the adapter changes behaviour on text the training set is not about.
+
+```yaml
+dop:
+  enabled: true
+  weight: 1.0
+  prompt: "a photo of a dog"   # fixed prior prompt, encoded ONCE at startup
+  # trigger: "sks"             # OR: prior = each caption with the trigger word removed
+  every: 1
+```
+
+Set exactly one of `prompt` or `trigger`. `prompt` is the cheap default. `trigger` is the tighter
+constraint — the prior becomes the *same sentence without the concept being taught* — but costs a
+live text encode of a second prompt every step, and needs captions in the cache.
+
+- **Costs roughly a doubled step, and raises peak memory**: one extra forward with gradients and one
+  without. Both the main and the preservation graph stay alive until backward, so activation memory
+  rises as well as time — budget for it before enabling this on a configuration that is already near
+  the memory ceiling. `every: N` amortises the time, but applies the regulariser unevenly; prefer
+  lowering `weight`.
+- Logged as a separate `dop` field in `metrics.jsonl`, never folded into `loss`, so the regulariser
+  cannot be mistaken for training progress. It should rise off zero and then stay bounded; a `dop`
+  that climbs steadily means the adapter is drifting further from the prior every step.
+- It shares the noised latent, timestep and reference dropout with the main loss, and the same
+  timestep weighting, so `weight` is directly comparable to the flow loss. It applies no edit
+  mask — preservation is global by definition.
+- **Adapters only.** With `lora.train_transformer: false` the term is identically zero and is
+  rejected. A full fine-tune would need a frozen reference copy of the model; this uses the fact
+  that an adapted model contains its own base.
+- With TE-LoRA the prior prompt is encoded with the **TE adapters disabled**, so the prior
+  conditioning is a constant of the base model; the term then constrains the DiT.
+- With `optim.compile_blocks` each block compiles twice (adapters on and off) — a one-off cost.
 
 ## 2c. Concept sliders
 

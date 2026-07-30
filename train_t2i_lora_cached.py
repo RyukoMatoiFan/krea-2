@@ -15,15 +15,16 @@ import os
 import random
 import signal
 import time
+from contextlib import nullcontext
 
 import torch
 
 from loading import build_dit, build_encoder, build_vae
-from lora import (inject_lora, inject_lora_te, load_lora_stage_init, load_lora_weights,
-                  lora_parameters, save_lora)
+from lora import (ema_named_tensors, inject_lora, inject_lora_te, load_lora_stage_init,
+                  load_lora_weights, lora_disabled, lora_parameters, save_lora)
 from scheduler import get_schedule_for_seqlen
 from train_t2i import (augment_reference_order, edit_training_step,
-                        encode_text_with_ref_dropout, t2i_training_step)
+                        encode_text_with_ref_dropout, strip_trigger, t2i_training_step)
 from train_t2i_full_joint_cached import (
     DEFAULT_PREVIEWS,
     home_volume_guard,
@@ -88,7 +89,8 @@ def main():
         raise SystemExit(
             "data.edit_vlm_cond requires a latents-only edit cache; rebuild with "
             "precache_edit.py --no-cache-text so grounded text is encoded live")
-    print(f"LoRA rank={lc.rank} alpha={lc.alpha or lc.rank}: {sum(bucket_weights)} train / "
+    print(f"LoRA variant={lc.variant} rank={lc.rank} alpha={lc.alpha or lc.rank}: "
+          f"{sum(bucket_weights)} train / "
           f"{len(eval_paths)} eval, buckets={bucket_keys}, live_text={use_live_text}, "
           f"te_lora={train_te} train_dit={lc.train_transformer}", flush=True)
 
@@ -148,9 +150,10 @@ def main():
         nq = quantize_frozen_linears_fp8(encoder.qwen)
         print(f"fp8-quantized {nq} frozen Qwen3-VL Linears", flush=True)
     if train_te:                                 # TE-LoRA: frozen Qwen3-VL base + trainable adapters
-        te_adapters = inject_lora_te(encoder.qwen, lc.te_rank, lc.alpha)
+        te_adapters = inject_lora_te(encoder.qwen, lc.te_rank, lc.alpha, variant=lc.variant)
         encoder.qwen.train()
-        print(f"injected {len(te_adapters)} TE-LoRA adapters (Qwen3-VL)", flush=True)
+        print(f"injected {len(te_adapters)} TE-LoRA adapters (Qwen3-VL, variant={lc.variant})",
+              flush=True)
     if marker is None and cfg.paths.lora_init:
         load_lora_stage_init(adapters, te_adapters, cfg.paths.lora_init)
         print(
@@ -161,6 +164,42 @@ def main():
     need_preview = bool(lg.sample_every) or args.smoke
     preview_encoder = encoder or (build_encoder(cfg, device, dtype, train=False) if need_preview else None)
     vae = build_vae(cfg, device, dtype) if need_preview else None
+
+    # ----- Differential output preservation: prior-prompt conditioning -----
+    dp = cfg.dop
+    dop_on = bool(dp.enabled) and float(dp.weight) != 0.0
+    dop_encoder, dop_fixed = None, None
+    if dop_on:
+        if dp.every < 1:
+            raise SystemExit("dop.every must be >= 1")
+        if not adapters:
+            raise SystemExit(
+                "dop.enabled requires lora.train_transformer=true: the preservation target is the "
+                "DiT's own prediction with its adapters disabled, so with a frozen DiT the term is "
+                "identically zero")
+        if bool(dp.prompt) == bool(dp.trigger):
+            raise SystemExit("set exactly one of dop.prompt (fixed prior prompt) or dop.trigger "
+                             "(strip the trigger word from each caption)")
+        # A prior prompt is text we choose at train time, so it must be ENCODED -- a latents-only
+        # cache cannot contain it. Reuse whichever encoder is already loaded rather than a third copy.
+        dop_encoder = encoder or preview_encoder
+        if dop_encoder is None:
+            dop_encoder = build_encoder(cfg, device, dtype, train=False)
+            print("dop: loaded a frozen text encoder to encode the prior prompt", flush=True)
+        if dp.trigger and "caption" not in load_sample(probe, device):
+            raise SystemExit(
+                "dop.trigger needs the caption in the cache to strip the trigger from; this cache has "
+                "none. Use dop.prompt with a fixed class prompt, or rebuild the cache with captions")
+        if dp.prompt:
+            # Fixed prompt -> encode once. Also encoded with the TE adapters OFF when TE-LoRA is on,
+            # so the prior conditioning is a constant of the BASE model and cannot drift with training
+            # (the term then constrains the DiT, which is what owns the prior being preserved).
+            with torch.no_grad(), (lora_disabled(dop_encoder.qwen) if te_adapters else nullcontext()):
+                pc, pm = dop_encoder([dp.prompt])
+            dop_fixed = (pc.to(device).detach(), pm.to(device).detach())
+        print(f"dop: ON weight={dp.weight} every={dp.every} "
+              f"{'prompt=' + repr(dp.prompt) if dp.prompt else 'trigger=' + repr(dp.trigger)} "
+              f"(~2x step cost)", flush=True)
 
     # Preview set: curated edit examples ([src|edit|tgt] rows) when a manifest is given, else t2i prompts.
     edit_examples = None
@@ -202,7 +241,7 @@ def main():
     metrics_path = os.path.join(output_dir, "metrics.jsonl")
     tracker = Tracker(lg.tracker, project=lg.wandb_project, run_name=lg.run_name or None, out_dir=output_dir)
 
-    def collate(paths, drop_refs=False, augment_order=False):
+    def collate(paths, drop_refs=False, augment_order=False, dop=False):
         # drop_refs (train batches only): with VLM dual conditioning, reference dropout is decided here
         # so the text encoding agrees with the latent refs — dropped samples are encoded text-only and
         # the mask travels to edit_training_step as ref_drop. Validation keeps it off.
@@ -213,9 +252,11 @@ def main():
         gh, gw = samples[0]["grid_h"], samples[0]["grid_w"]
         z0 = torch.stack([s["z_tgt"] for s in samples]).to(device, torch.float32)
         ref_drop = None
+        # Hoisted: the prior-prompt encoding below reuses the same captions and the same VLM image
+        # groups, so the prior differs from the training conditioning ONLY in the text.
+        caps = [s.get("caption", "") for s in samples]
+        vlm_imgs = None
         if use_live_text:
-            caps = [s["caption"] for s in samples]
-            vlm_imgs = None
             if cfg.data.edit_vlm_cond and samples[0].get("ref_paths"):
                 from PIL import Image
 
@@ -263,23 +304,33 @@ def main():
             refs = [torch.stack([s["refs"][i]["tokens"] for s in samples]).to(device, torch.float32)
                     for i in range(len(ref_grids))]
         ref_geometry = cache_edit_ref_geometry(samples, cfg.data.edit_ref_geometry)
+        ctx_p = mask_p = None
+        if dop and dop_on:
+            if dop_fixed is not None:
+                # One encoding shared by the batch: the prior prompt does not vary per sample.
+                ctx_p = dop_fixed[0].expand(len(samples), *dop_fixed[0].shape[1:])
+                mask_p = dop_fixed[1].expand(len(samples), *dop_fixed[1].shape[1:])
+            else:
+                prior_caps = [strip_trigger(c, dp.trigger) for c in caps]
+                with torch.no_grad(), (lora_disabled(dop_encoder.qwen) if te_adapters
+                                       else nullcontext()):
+                    ctx_p, mask_p = dop_encoder(prior_caps, images=vlm_imgs)
+                ctx_p, mask_p = ctx_p.to(device).detach(), mask_p.to(device).detach()
         return (z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags,
-                ref_geometry == "fit")
+                ref_geometry == "fit", ctx_p, mask_p)
 
-    def sample_batch():
+    def sample_batch(dop=False):
         key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
         files = train_by_bucket[key]
         return collate([rng.choice(files) for _ in range(o.batch)],
-                       drop_refs=True, augment_order=True)
+                       drop_refs=True, augment_order=True, dop=dop)
 
     # ----- EMA over the adapter tensors (cheap: only the LoRA params) -----
     ema = None
     if o.use_ema:
-        named = {}
-        for pool_tag, pool in (("dit", adapters), ("te", te_adapters)):
-            for name, m in pool.items():
-                named[f"{pool_tag}.{name}.lora_A"] = m.lora_A
-                named[f"{pool_tag}.{name}.lora_B"] = m.lora_B
+        # Variant-agnostic: LoKr/OFT/BOFT have no lora_A/lora_B at all, and DoRA's magnitude plus
+        # LoHa's second pair must be averaged too (see lora.ema_named_tensors).
+        named = ema_named_tensors({"dit": adapters, "te": te_adapters})
         ema = EmaModel(named, o.ema_decay, every=o.ema_every)
         print(f"EMA on: decay={o.ema_decay}, every={o.ema_every}", flush=True)
 
@@ -303,7 +354,8 @@ def main():
                     batches.append(((collate(chunk), vsched), len(chunk)))
 
             def loss_fn(packed, q):
-                (z0, ctx, mask, gh, gw, refs, ref_grids, _, _, center_refs), vsched = packed
+                # Validation is a plain MSE against the data, never a preservation term.
+                (z0, ctx, mask, gh, gw, refs, ref_grids, _, _, center_refs, _, _), vsched = packed
                 t = float(vsched(torch.tensor([float(q)])).item())
                 g = torch.Generator(device=device).manual_seed(cfg.runtime.seed + int(round(q * 1000)))
                 if refs is not None:
@@ -392,11 +444,15 @@ def main():
         torch.cuda.reset_peak_memory_stats()  # peak_gb = training peak, not the one-time model-load spike
     t0 = time.time()
     run_loss = 0.0
+    run_dop = 0.0
+    n_dop = 0
     n_skipped = 0
     for step in range(start_step, steps):
         _state["step"] = step
+        dop_step = dop_on and (step % dp.every == 0)
         (z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags,
-         center_refs) = sample_batch()
+         center_refs, ctx_p, mask_p) = sample_batch(dop_step)
+        parts = {} if dop_step else None
         schedule = get_schedule_for_seqlen(gh * gw, sigma=fl.sigma, base_shift=fl.base_shift,
                                            max_shift=fl.max_shift, base_seq_len=fl.base_image_seq_len,
                                            max_seq_len=fl.max_image_seq_len)
@@ -412,11 +468,15 @@ def main():
                                       text_mask=mask, grid_h=gh, grid_w=gw, schedule=schedule,
                                       flow_cfg=fl, generator=gen, cfg_dropout_prob=o.cfg_dropout_prob,
                                       ref_dropout_prob=cfg.data.ref_dropout_prob, loss_mask=lmask,
-                                      ref_drop_mask=ref_drop, center_refs=center_refs)
+                                      ref_drop_mask=ref_drop, center_refs=center_refs,
+                                      preserve_context=ctx_p, preserve_text_mask=mask_p,
+                                      preserve_weight=dp.weight, loss_parts=parts)
         else:
             loss = t2i_training_step(dit, z0=z0, context=ctx, text_mask=mask, grid_h=gh, grid_w=gw,
                                      schedule=schedule, flow_cfg=fl, generator=gen,
-                                     cfg_dropout_prob=o.cfg_dropout_prob)
+                                     cfg_dropout_prob=o.cfg_dropout_prob,
+                                     preserve_context=ctx_p, preserve_text_mask=mask_p,
+                                     preserve_weight=dp.weight, loss_parts=parts)
         if not is_finite_loss(loss):
             n_skipped += 1
             opt.zero_grad(set_to_none=True)
@@ -430,6 +490,9 @@ def main():
             opt.zero_grad(set_to_none=True)
         sched_lr.step()
         run_loss += float(loss.detach())
+        if parts:
+            run_dop += parts["loss_dop"]
+            n_dop += 1
         if ema is not None:
             ema.update(step)
 
@@ -438,6 +501,11 @@ def main():
             rec = {"step": step + 1, "loss": run_loss / lg.log_every, "lr": sched_lr.get_last_lr()[0],
                    "s_per_step": round(dt, 3), "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
                    "skipped": n_skipped}
+            if n_dop:
+                # Averaged over the steps that COMPUTED it (dop.every > 1 leaves the others out),
+                # and reported apart from `loss` so the regulariser cannot be mistaken for progress.
+                rec["dop"] = round(run_dop / n_dop, 6)
+                run_dop, n_dop = 0.0, 0
             with open(metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
             tracker.log(rec, rec["step"])

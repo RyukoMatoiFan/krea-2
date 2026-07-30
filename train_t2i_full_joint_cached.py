@@ -553,16 +553,21 @@ def main():
                 "optim.quantize_te is only supported for a frozen text encoder, "
                 "not full TE fine-tuning or TE-LoRA")
         if train_te and _te_mode == "lora":
-            te_adapters = inject_lora_te(encoder.qwen, lc.te_rank or lc.rank, lc.alpha)
+            te_adapters = inject_lora_te(encoder.qwen, lc.te_rank or lc.rank, lc.alpha,
+                                         variant=lc.variant)
             encoder.qwen.train()
             print(f"TE-LoRA: injected {len(te_adapters)} adapters (Qwen3-VL base frozen, "
-                  f"rank={lc.te_rank or lc.rank})", flush=True)
+                  f"variant={lc.variant}, rank={lc.te_rank or lc.rank})", flush=True)
         # Weights-only TE warm start (no optimizer/scheduler state, unlike resume_from).
         if cfg.paths.te_init:
             from safetensors.torch import load_file as _load_te
 
             sd = _load_te(cfg.paths.te_init)
-            is_lora_ckpt = any(".lora_A" in k or ".lora_B" in k for k in sd)
+            # Adapter checkpoints are keyed `text_encoder.<module>.<tensor>.weight` (save_lora), full
+            # ones carry the encoder's own state-dict names. Sniffing for `.lora_A` instead would
+            # classify an OFT/LoKr/BOFT adapter file as a FULL encoder -- those variants have no such
+            # tensor -- and then load it with strict=False, which discards every key in silence.
+            is_lora_ckpt = any(k.startswith("text_encoder.") for k in sd)
             if is_lora_ckpt != bool(te_adapters):
                 raise SystemExit(
                     f"te_init mismatch: checkpoint is {'TE-LoRA' if is_lora_ckpt else 'full-TE'} but "

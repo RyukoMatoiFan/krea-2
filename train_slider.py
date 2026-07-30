@@ -131,10 +131,12 @@ def main():
     # 3) train
     adapters = inject_lora(dit, rank=rank, alpha=lc.alpha,
                            include_txtfusion=lc.target_txtfusion,
-                           include_txtmlp=lc.target_txtmlp)
+                           include_txtmlp=lc.target_txtmlp,
+                           variant=lc.variant)
     params = lora_parameters(adapters)
     opt = torch.optim.AdamW(params, lr=float(cfg.optim.lr))
-    print(f"[slider] {len(adapters)} adapters, {sum(p.numel() for p in params)/1e6:.1f}M params", flush=True)
+    print(f"[slider] {len(adapters)} adapters (variant={lc.variant}), "
+          f"{sum(p.numel() for p in params)/1e6:.1f}M params", flush=True)
     gen = torch.Generator(device=device).manual_seed(int(cfg.runtime.seed))
     rng = torch.Generator(device="cpu").manual_seed(int(cfg.runtime.seed))
     dit.gradient_checkpointing = True   # the bidirectional ±s grad passes are memory-heavy; ckpt fits 768+/1024
