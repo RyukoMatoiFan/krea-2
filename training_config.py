@@ -144,6 +144,9 @@ class OptimConfig:
   offload_optimizer: bool = False  # full-FT: keep Adam moments in CPU RAM (lower VRAM, host-RAM cost)
   blocks_to_swap: int = 0          # page N deepest blocks CPU<->GPU per fwd/bwd (LoRA: frozen base only; full-FT pages all, slower)
   quantize_base: str = ""          # LoRA: "" off | "fp8" (e4m3 storage, dequantized per forward)
+                                   # | "int8" / "int4" (ConvRot: rotated, matmul on int8 tensor
+                                   # cores; int4 packs two codes per byte, halving the resident
+                                   # weight again). Both int paths are incompatible with variant=dora
                                    # | "int8" (ConvRot W8A8: the matmul itself runs on int8 tensor
                                    # cores, so it lowers memory AND compute; needs Ampere or newer)
   quantize_te: str = ""            # frozen live Qwen3-VL: "" off | "fp8" weight storage

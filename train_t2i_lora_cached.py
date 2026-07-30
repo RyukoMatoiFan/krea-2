@@ -108,8 +108,21 @@ def main():
             raise SystemExit("quantize_base=int8 needs int8 tensor cores (Ampere or newer)")
         nq = quantize_dit_int8(dit)
         print(f"int8-quantized {nq} frozen base Linears (attn+mlp)", flush=True)
+    elif quant == "int4":
+        # The same ConvRot rotation at four bits with per-group scales: a quarter of bf16 resident.
+        # Unlike int8 this is a MEMORY lever only -- there is no 4-bit GEMM, so the weight is
+        # dequantized one layer at a time and the matmul runs in the activation's dtype.
+        from convrot_int4 import quantize_dit_int4, weight_error
+
+        probe = next((m for m in dit.blocks[0].modules() if isinstance(m, torch.nn.Linear)), None)
+        err = f", weight error {weight_error(probe):.2%}" if probe is not None else ""
+        nq = quantize_dit_int4(dit)
+        # Reported at startup because four bits is the coarsest setting here and its cost is
+        # model-dependent: a number at launch beats inferring it from the samples.
+        print(f"int4-quantized {nq} frozen base Linears (attn+mlp){err}", flush=True)
     elif quant:
-        raise SystemExit(f"unknown optim.quantize_base {quant!r}; expected '', 'fp8' or 'int8'")
+        raise SystemExit(
+            f"unknown optim.quantize_base {quant!r}; expected '', 'fp8', 'int8' or 'int4'")
     adapters = inject_lora(dit, lc.rank, lc.alpha,
                            include_txtfusion=lc.target_txtfusion,
                            include_txtmlp=lc.target_txtmlp,

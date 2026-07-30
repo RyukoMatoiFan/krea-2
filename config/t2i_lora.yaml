@@ -28,7 +28,7 @@ optim:
   weight_decay: 0.0
   grad_clip: 1.0
   grad_checkpointing: true
-  quantize_base: ""        # "" | fp8 | int8
+  quantize_base: ""        # "" | fp8 | int8 | int4
   quantize_te: ""          # "" | fp8; frozen live Qwen3-VL only
   compile_blocks: false    # per-block torch.compile; cannot combine with blocks_to_swap
   cfg_dropout_prob: 0.1

@@ -187,6 +187,7 @@ Three independent levers. They compose, and none changes the training objective.
 | `optim.blocks_to_swap: N` | parks the N deepest blocks on CPU, pages each in for its forward/backward | gradient checkpointing; costs host↔device copies |
 | `optim.quantize_base: fp8` | frozen attn+MLP weights as e4m3 + per-row scale, dequantized per forward | gradient checkpointing (forced on) |
 | `optim.quantize_base: int8` | the same weights rotated and stored as int8; the **matmul runs on int8 tensor cores**, so compute drops too | int8 tensor cores (Ampere+); incompatible with `variant: dora` |
+| `optim.quantize_base: int4` | the same rotation at **four bits with a per-group scale and offset**, two codes per byte — the **lowest-VRAM** option. A memory lever only: there is no 4-bit GEMM, so the weight is dequantized one layer at a time and the matmul runs in the activation's dtype | no tensor-core requirement; incompatible with `variant: dora`; the coarsest setting, so check the weight error printed at startup |
 | `optim.quantize_te: fp8` | frozen live Qwen3-VL linear weights as e4m3 + per-row scale | frozen TE only; incompatible with TE full fine-tuning and TE-LoRA |
 | `optim.compile_blocks: true` | compiles each DiT block after adapter injection | LoRA transformer training; incompatible with block swap |
 
