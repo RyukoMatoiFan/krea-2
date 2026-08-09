@@ -1,8 +1,7 @@
 # Krea 2 — training
 
 A full fine-tune / LoRA training stack for Krea 2, on top of the krea-ai/krea-2 model code
-(`mmdit.py`, `encoder.py`, `autoencoder.py`, `sampling.py`), which are unchanged except a small
-marked `gradient_checkpointing` hook in `mmdit.py`. Train on **Raw**, run on **Turbo** (Krea's
+(`mmdit.py`, `encoder.py`, `autoencoder.py`, `sampling.py`). Train on **Raw**, run on **Turbo** (Krea's
 recommended workflow).
 
 ## Environment
@@ -41,13 +40,18 @@ adafactor`) + gradient checkpointing + bf16 stochastic rounding. `--smoke` runs 
 preview then exits (`SMOKE OK`). DiT-only when caches hold `llm_text` and `te_lr: 0`; set `te_lr`
 (e.g. `1e-6`) to jointly fine-tune the text encoder.
 
-Throughput switches, all off by default and none changing the objective:
+Lossless throughput switches (the full-FT example config enables the first three):
 
 | option | effect |
 |---|---|
 | `optim.adafactor_kernel: triton` | same update without materialising the fp32 gradient copy or the update tensor |
-| `data.pad_to_multiple: 0` | no sequence padding; with one sample per step the mask is empty and attention runs unmasked |
-| `data.skip_ref_cross_attention: true` | multi-reference only: block-sparse mask dropping attention between *different* references (exact — those blocks carry no meaning) |
+| `data.pad_to_multiple: 0` | no sequence padding; padding masks use a compact key-only broadcast instead of an `L×L` tensor when padding is retained |
+| `optim.compile_blocks: true` | full-graph regional compile of each DiT block; dynamic sequence length avoids caption/reference recompiles and normal checkpoint keys are preserved |
+| `optim.grad_checkpointing_blocks: N` | checkpoint only the first N DiT blocks; lower values avoid recompute but spend activation memory (`-1` = all) |
+
+`data.skip_ref_cross_attention: true` is a separate, objective-changing experiment: it removes
+reference-to-reference attention. It can be faster for many references, but is not in the lossless
+set and should be quality-gated before use.
 
 Flow-matching convention (see `constants.py`): **t=1 noise, t=0 data**, `x_t = t·noise + (1-t)·x0`,
 velocity target `v = noise - x0`. Timesteps normally use Krea's resolution-aware `mu` shift
@@ -189,7 +193,7 @@ Three independent levers. They compose, and none changes the training objective.
 | `optim.quantize_base: int8` | the same weights rotated and stored as int8; the **matmul runs on int8 tensor cores**, so compute drops too | int8 tensor cores (Ampere+); incompatible with `variant: dora` |
 | `optim.quantize_base: int4` | the same rotation at **four bits with a per-group scale and offset**, two codes per byte — the **lowest-VRAM** option. A memory lever only: there is no 4-bit GEMM, so the weight is dequantized one layer at a time and the matmul runs in the activation's dtype | no tensor-core requirement; incompatible with `variant: dora`; the coarsest setting, so check the weight error printed at startup |
 | `optim.quantize_te: fp8` | frozen live Qwen3-VL linear weights as e4m3 + per-row scale | frozen TE only; incompatible with TE full fine-tuning and TE-LoRA |
-| `optim.compile_blocks: true` | compiles each DiT block after adapter injection | LoRA transformer training; incompatible with block swap |
+| `optim.compile_blocks: true` | compiles each DiT block after adapter injection without changing state-dict keys | transformer training; incompatible with block swap |
 
 ```bash
 KREA2_OPTIM__BLOCKS_TO_SWAP=14 python train_t2i_lora_cached.py --config config/t2i_lora.yaml

@@ -482,6 +482,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     ap.add_argument("--smoke", action="store_true", help="run ~20 steps + one preview, then exit")
+    ap.add_argument("--benchmark-steps", type=int, default=0,
+                    help="run N training steps without previews or a final checkpoint")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -523,10 +525,20 @@ def main():
 
     dit = build_dit(cfg, device, dtype, load_weights=True, train=o.train_dit)
     dit.gradient_checkpointing = o.grad_checkpointing
+    dit.gradient_checkpointing_blocks = o.grad_checkpointing_blocks
     dit.pad_to_multiple = cfg.data.pad_to_multiple
     dit.skip_ref_cross_attention = cfg.data.skip_ref_cross_attention
     if not o.train_dit:
         dit.eval().requires_grad_(False)
+    if o.compile_blocks:
+        if o.blocks_to_swap:
+            raise SystemExit("optim.compile_blocks and optim.blocks_to_swap cannot be combined")
+        if not o.train_dit:
+            raise SystemExit("optim.compile_blocks requires optim.train_dit=true")
+        ncompiled = dit.compile_blocks(o.compile_mode, dynamic=o.compile_dynamic)
+        print(f"compiled {ncompiled} DiT blocks (mode={o.compile_mode}, fullgraph, "
+              f"dynamic={o.compile_dynamic})",
+              flush=True)
     if o.blocks_to_swap:
         # Page the deepest blocks CPU<->GPU. FFT (train_dit) must page trainable weights too (slow);
         # DiT-frozen runs keep them resident. Block swap is most useful in the LoRA trainer (frozen base).
@@ -607,7 +619,8 @@ def main():
         preview_encoder = encoder
     # eval_steps can request a render independently of sample_every; without this the preview
     # resources are never built, do_preview() silently no-ops, and the scorer sees a missing sheet.
-    need_preview = bool(lg.sample_every) or args.smoke or bool(str(lg.eval_steps).strip())
+    need_preview = (not args.benchmark_steps) and (
+        bool(lg.sample_every) or args.smoke or bool(str(lg.eval_steps).strip()))
     vae = build_vae(cfg, device, dtype) if need_preview else None
     if need_preview and preview_encoder is None:
         # DiT-only training (cached text): still need a frozen encoder to render previews.
@@ -750,12 +763,23 @@ def main():
                 from PIL import Image
 
                 from sample_edit import _vlm_resize
+                def _open_vlm_image(path):
+                    try:
+                        return Image.open(path)
+                    except FileNotFoundError:
+                        if not args.benchmark_steps:
+                            raise
+                        # Benchmark mode measures the live VLM path even when an archived cache's
+                        # original pixels are no longer mounted. Pixel values do not affect shapes
+                        # or throughput; production training still fails loudly on a missing file.
+                        side = max(32, int(cfg.data.vlm_image_size))
+                        return Image.new("RGB", (side, side))
                 # One GROUP of images per sample, in the same order the refs are packed as latents,
                 # so a caption saying "image_2" resolves to refs[1] in both the text encoder and the
                 # DiT stream. Passing only ref_paths[0] would make multi-reference composition
                 # instructions ungroundable (the encoder would never see the second subject).
                 vlm_imgs = [[_vlm_resize(
-                                 Image.open(p), cfg.data.vlm_image_size,
+                                 _open_vlm_image(p), cfg.data.vlm_image_size,
                                  cfg.data.vlm_image_min_size, rng)
                              for p in s["ref_paths"]] for s in samples]
             if vlm_imgs is not None and drop_refs and cfg.data.ref_dropout_prob > 0.0:
@@ -1007,7 +1031,7 @@ def main():
         _state["step"] = start_step
         print(f"RESUMED at step {start_step} from {os.path.basename(marker['_weights_path'])}", flush=True)
 
-    steps = 20 if args.smoke else o.steps
+    steps = args.benchmark_steps or (20 if args.smoke else o.steps)
     print(f"training {steps} steps (fused={fused}, optim_state={o.optimizer_state}, te_lr={te_lr})", flush=True)
 
     # ----- Run provenance: what code + config this run ACTUALLY executed -----
@@ -1286,7 +1310,9 @@ def main():
                     break
             t0 = time.time()   # don't bill eval wall-time to the next step's s/step
 
-    if args.smoke:
+    if args.benchmark_steps:
+        print("BENCHMARK OK", flush=True)
+    elif args.smoke:
         do_preview("smoke")
         print("SMOKE OK", flush=True)
     elif o.train_dit and not stopped_early:

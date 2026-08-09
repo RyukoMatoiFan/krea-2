@@ -11,13 +11,19 @@ optim:
   weight_decay: 0.01
   grad_clip: 1.0
   grad_checkpointing: true
+  grad_checkpointing_blocks: -1  # lower toward 0 only after a peak-VRAM benchmark at the real shape
   optimizer_state: adafactor   # on-GPU factored second moment reduces optimizer-state memory
+  adafactor_kernel: triton     # lossless fused update; avoids materialising parameter-sized temporaries
+  compile_blocks: true         # regional full-graph compile of the repeated DiT blocks
+  compile_mode: default
+  compile_dynamic: true        # captions/reference counts vary; do not compile one graph per length
   cfg_dropout_prob: 0.1
   lr_scheduler: cosine
   min_lr_ratio: 0.1
 data:
   cache_annotations: ""     # optional filename-to-annotation JSON sidecar for existing caches
   resolution: 1024
+  pad_to_multiple: 0          # batch=1 exact shapes: avoid computing padded tokens
   n_eval_holdout: 4
 flow:
   base_shift: 0.5
@@ -29,7 +35,7 @@ flow:
 logging:
   log_every: 25
   ckpt_every: 1000
-  sample_every: 1000
+  sample_every: 0           # keep VAE/preview encoder out of the training process; enable deliberately
   sample_steps: 28
   sample_guidance: 4.5
   sample_count: 4

@@ -44,6 +44,13 @@ def attention(
         # them, which a dense boolean mask cannot do. This is how reference<->reference attention
         # is dropped.
         x = _flex(q, k, v, block_mask=mask, scale=scale, enable_gqa=gqa)
+    elif torch.compiler.is_compiling():
+        # The backend-selection context is a graph break inside a compiled transformer block.
+        # Default SDPA still selects the best available kernel for these tensors, while keeping
+        # RMSNorm/modulation/gating/residual operations in the same Inductor graph.
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
+        )
     else:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
             x = F.scaled_dot_product_attention(
@@ -53,8 +60,13 @@ def attention(
 
 
 def _mask(mask: Tensor) -> Tensor:
-    """Expand a (B, L) key-padding mask into a (B, 1, L, L) attention mask."""
-    return mask.unsqueeze(1).unsqueeze(2) * mask.unsqueeze(1).unsqueeze(3)
+    """Broadcast a (B, L) key-padding mask without materialising an L-by-L tensor.
+
+    Outputs at padded query positions are discarded, and padded positions are masked as keys, so
+    masking queries as well cannot affect any retained token. The compact form is mathematically
+    equivalent for retained outputs and is substantially cheaper for long edit sequences.
+    """
+    return mask.unsqueeze(1).unsqueeze(2)
 
 
 def _is_block_mask(mask) -> bool:
@@ -172,7 +184,6 @@ class PositionalEncoding(torch.nn.Module):
         self.theta = theta
         self.ntk = ntk
 
-    @torch.compile(fullgraph=True)
     def forward(self, pos: Tensor) -> Tensor:
         return torch.cat(
             [
@@ -202,7 +213,6 @@ class RMSNorm(torch.nn.Module):
             torch.zeros(features, device=device, dtype=torch.float32)
         )
 
-    @torch.compile(fullgraph=True)
     def forward(self, x: Tensor) -> Tensor:
         t, dtype = x.float(), x.dtype
         t = F.rms_norm(
@@ -269,7 +279,6 @@ class LastLayer(torch.nn.Module):
         self.linear = torch.nn.Linear(features, patch * patch * channels, bias=True)
         self.modulation = SimpleModulation(features)
 
-    @torch.compile(fullgraph=True)
     def forward(self, x: Tensor, tvec: Tensor) -> Tensor:
         scale, shift = self.modulation(tvec)
         x = (1 + scale) * self.norm(x) + shift
@@ -434,6 +443,9 @@ class SingleStreamDiT(nn.Module):
 
         # Set True by the trainer for full fine-tune memory savings; inference leaves it False.
         self.gradient_checkpointing = False
+        # -1 checkpoints every transformer block. A smaller non-negative value checkpoints only
+        # that many leading blocks, spending otherwise-free VRAM to avoid recompute losslessly.
+        self.gradient_checkpointing_blocks = -1
 
         # Block-swap state (configured by enable_block_swap): the deepest blocks live on CPU and
         # page to the GPU only while in use. Empty set = disabled (zero overhead in forward).
@@ -441,12 +453,13 @@ class SingleStreamDiT(nn.Module):
         self._swap_device: torch.device | None = None
         self._swap_skip_trainable = True
 
-    def compile_blocks(self, mode: str = "default") -> int:
-        """Compile transformer blocks independently and return the number wrapped."""
+    def compile_blocks(self, mode: str = "default", *, dynamic: bool = False) -> int:
+        """Compile transformer block callables without changing registered module/state keys."""
         if self._swap_blocks:
             raise RuntimeError("block compilation must be configured before block swap")
-        for i, block in enumerate(self.blocks):
-            self.blocks[i] = torch.compile(block, mode=mode)
+        for block in self.blocks:
+            block._compiled_forward = torch.compile(
+                block.forward, mode=mode, fullgraph=True, dynamic=bool(dynamic))
         return len(self.blocks)
 
     def enable_block_swap(self, num_blocks: int, device, *, skip_trainable: bool = True) -> list[int]:
@@ -527,9 +540,8 @@ class SingleStreamDiT(nn.Module):
         combined = torch.cat((context, img), dim=1)
 
         # Pad the combined sequence to a multiple of ``pad_to_multiple`` to stabilize compiled
-        # kernel shapes. Set it to 0 to disable: the padding forces a key-padding mask to exist,
-        # and a dense (B,1,L,L) mask is costly at long sequences, so with a single sample per step
-        # (where the text needs no padding either) dropping both lets attention run unmasked.
+        # kernel shapes. Set it to 0 to avoid computing padded tokens. If padding remains, `_mask`
+        # supplies a compact key-only broadcast rather than materialising an L-by-L tensor.
         fulllen = combined.shape[1]
         _padlen = (-fulllen) % self.pad_to_multiple if self.pad_to_multiple else 0
         if _padlen > 0:
@@ -570,12 +582,19 @@ class SingleStreamDiT(nn.Module):
             tvec = tok
 
         swap = self._swap_blocks
+        checkpoint_blocks = self.gradient_checkpointing_blocks
+        if checkpoint_blocks < 0:
+            checkpoint_blocks = len(self.blocks)
         for i, block in enumerate(self.blocks):
             swapped = i in swap
-            if self.gradient_checkpointing and self.training:
+            # Sampling/preview stays eager: inference has different grad/mode/shape guards and
+            # compiling it would add graphs to the long-lived training cache for no step-time gain.
+            block_forward = (getattr(block, "_compiled_forward", block)
+                             if self.training else block)
+            if self.gradient_checkpointing and self.training and i < checkpoint_blocks:
                 inp = combined
                 combined = torch.utils.checkpoint.checkpoint(
-                    block, inp, tvec, freqs, mask, use_reentrant=False
+                    block_forward, inp, tvec, freqs, mask, use_reentrant=False
                 )
                 if swapped:
                     # Real forward done; the checkpoint recompute re-pages the block in via the
@@ -585,7 +604,7 @@ class SingleStreamDiT(nn.Module):
                         inp.register_hook(self._mk_post_bwd_offload(block))
             else:
                 inp = combined
-                combined = block(inp, tvec, freqs, mask)
+                combined = block_forward(inp, tvec, freqs, mask)
                 if swapped:
                     if not self.training:
                         self._swap_offload(block)                 # inference: free immediately

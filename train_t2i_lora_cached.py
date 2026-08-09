@@ -135,6 +135,7 @@ def main():
     if fp8_base and not o.grad_checkpointing:
         print("note: enabling gradient checkpointing (required by the fp8 base)", flush=True)
     dit.gradient_checkpointing = o.grad_checkpointing or fp8_base
+    dit.gradient_checkpointing_blocks = o.grad_checkpointing_blocks
     dit.train()  # enables grad-ckpt; base params stay frozen, only adapters require grad
     print(f"injected {len(adapters)} LoRA adapters", flush=True)
     if o.compile_blocks:
@@ -142,8 +143,9 @@ def main():
             raise SystemExit("optim.compile_blocks and optim.blocks_to_swap cannot be combined")
         if not lc.train_transformer:
             raise SystemExit("optim.compile_blocks requires lora.train_transformer=true")
-        ncompiled = dit.compile_blocks(o.compile_mode)
-        print(f"compiled {ncompiled} transformer blocks (mode={o.compile_mode})", flush=True)
+        ncompiled = dit.compile_blocks(o.compile_mode, dynamic=o.compile_dynamic)
+        print(f"compiled {ncompiled} transformer blocks (mode={o.compile_mode}, "
+              f"fullgraph, dynamic={o.compile_dynamic})", flush=True)
     if o.blocks_to_swap:
         # Page the deepest blocks' frozen base CPU<->GPU; LoRA adapters (trainable) stay GPU-resident.
         # Large VRAM saving for >1024 / larger LoRA. Needs grad-ckpt.

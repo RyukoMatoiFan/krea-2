@@ -129,6 +129,8 @@ class OptimConfig:
                              # norm can be formed. Each tensor is bounded by this value, but the
                              # aggregate model norm can reach ~sqrt(n_tensors) * grad_clip.
   grad_checkpointing: bool = True
+  grad_checkpointing_blocks: int = -1  # -1 = all DiT blocks; 0..N checkpoints only that many,
+                                       # trading VRAM for less lossless forward recomputation
   adafactor_kernel: str = "eager"  # eager | triton -- the fused per-parameter Adafactor update.
                                    # "triton" computes the same math without materialising the
                                    # fp32 gradient copy or the update tensor, so the update stops
@@ -150,8 +152,9 @@ class OptimConfig:
                                    # | "int8" (ConvRot W8A8: the matmul itself runs on int8 tensor
                                    # cores, so it lowers memory AND compute; needs Ampere or newer)
   quantize_te: str = ""            # frozen live Qwen3-VL: "" off | "fp8" weight storage
-  compile_blocks: bool = False     # LoRA: torch.compile each transformer block after adapter injection
+  compile_blocks: bool = False     # torch.compile each DiT transformer block (FFT or LoRA)
   compile_mode: str = "default"    # torch.compile mode
+  compile_dynamic: bool = True     # dynamic sequence length avoids recompiles across captions/refs
   weight_decay: float = 0.01       # full-FT AdamW weight decay
   te_lr: float = 0.0               # joint full-FT: separate (lower) LR for the text encoder;
                                    # 0 -> lr/10 when training the DiT too, else lr (TE-only stage)
