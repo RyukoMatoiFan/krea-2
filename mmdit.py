@@ -10,6 +10,21 @@ from einops import rearrange
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+# Whether the cuDNN SDPA backend can actually be pinned here. It is the fastest option where it
+# exists, but pinning a backend that is not available turns into a hard failure inside SDPA,
+# and three separate things can make it unavailable:
+#   * ROCm -- torch.cuda is HIP under an alias, so is_available() is True and the enum member
+#     still exists, yet there is no cuDNN. Only torch.version.hip distinguishes the builds.
+#   * a CPU tensor -- the build having a GPU says nothing about where this tensor lives.
+#   * a wheel compiled without the backend.
+# Pin only when all three are ruled out; otherwise let SDPA choose, which is what it does on
+# the compiled path anyway.
+_CUDNN_SDPA = (
+    hasattr(SDPBackend, "CUDNN_ATTENTION")
+    and torch.cuda.is_available()
+    and torch.version.hip is None
+)
+
 
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
     scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
@@ -51,11 +66,17 @@ def attention(
         x = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
         )
-    else:
+    elif _CUDNN_SDPA and q.is_cuda:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
             x = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
             )
+    else:
+        # No cuDNN backend here (ROCm/HIP, a CPU tensor, or a wheel without it). Default
+        # selection picks the best kernel the platform has rather than raising on a pin.
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
+        )
     return rearrange(x, "B H L D -> B L (H D)")
 
 

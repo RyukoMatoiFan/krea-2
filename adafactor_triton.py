@@ -112,11 +112,46 @@ def _grid(M, N, bm, bn):
     return (triton.cdiv(M, bm), triton.cdiv(N, bn))
 
 
+_ATOMICS_VERIFIED = False
+
+
+def _verify_atomics(device) -> None:
+    """Prove fp32 ``tl.atomic_add`` actually accumulates on this device before trusting it.
+
+    Both reductions in this file accumulate through atomics, and a dropped atomic here is silent:
+    the row/col sums stay at their epsilon floor and the update comes out with a wildly wrong
+    scale, with no fault, no warning and a loss curve that merely looks disappointing. On some
+    accelerators a native fp32 atomic add is discarded by hardware against certain memory types,
+    and allocator settings can map memory through a less conventional path than a plain device
+    malloc -- so the combination is worth one microsecond of proof rather than an assumption.
+
+    Not gated on vendor: it costs one tiny kernel once per process and would equally catch a
+    backend miscompile on any platform. Every value is a small integer exactly representable in
+    fp32, so the comparison is exact and needs no tolerance.
+    """
+    global _ATOMICS_VERIFIED
+    if _ATOMICS_VERIFIED:
+        return
+    M, N, BM, BN = 256, 512, 32, 128
+    g = torch.ones(M, N, device=device, dtype=torch.float32)
+    row = torch.zeros(M, device=device, dtype=torch.float32)
+    col = torch.zeros(N, device=device, dtype=torch.float32)
+    _rowcol_sumsq_kernel[_grid(M, N, BM, BN)](g, row, col, M, N, N, 1,
+                                              BLOCK_M=BM, BLOCK_N=BN)
+    if not (torch.equal(row, torch.full_like(row, float(N)))
+            and torch.equal(col, torch.full_like(col, float(M)))):
+        raise RuntimeError(
+            "adafactor_triton: fp32 tl.atomic_add did not accumulate correctly on this device. "
+            "The Adafactor update would be silently wrong -- rerun with optim.adafactor_kernel=eager.")
+    _ATOMICS_VERIFIED = True
+
+
 @torch.no_grad()
 def triton_adafactor_step(p: Tensor, g: Tensor, row: Tensor, col: Tensor, *,
                           beta2t: float, lr: float, wd: float, stochastic: bool,
                           seed: int, block_m: int = 32, block_n: int = 128) -> None:
     """One Adafactor step for a 2D parameter, in place. ``g`` may be bf16 (never upcast in bulk)."""
+    _verify_atomics(p.device)
     M, N = p.shape
     sm, sn = p.stride()
     grid = _grid(M, N, block_m, block_n)

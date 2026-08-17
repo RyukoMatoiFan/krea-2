@@ -1,0 +1,32 @@
+# Dependencies for a ROCm (AMD) host, to be installed INTO a vendor rocm/pytorch container.
+#
+# Deliberately omits torch and triton. The container already ships a matched
+# torch+rocm / pytorch-triton-rocm pair, and both must come from there:
+#
+#   * pyproject.toml pins torch to a CUDA index on Linux, so `uv sync` on an AMD host installs a
+#     CUDA build whose torch.cuda.is_available() is False.
+#   * PyPI `triton` is the NVIDIA build and claims the same top-level module name as
+#     pytorch-triton-rocm. If both are present the winner decides whether the Adafactor kernel gets
+#     an AMD-capable compiler, and the NVIDIA one fails at the first kernel LAUNCH rather than at
+#     import -- i.e. after the model and caches are already resident.
+#
+# Install with --no-deps so pip cannot pull a CUDA torch in as a transitive dependency:
+#
+#     pip install --no-deps -r requirements-rocm.txt
+#     pip install regex tokenizers requests filelock packaging   # pure-python transitives
+#
+# Then verify nothing NVIDIA-flavoured slipped in:
+#
+#     pip list | grep -Ei '^(triton|nvidia-|cuda-)'   # expect ONLY pytorch-triton-rocm
+#
+transformers==4.57.1
+diffusers>=0.35.0
+safetensors>=0.4.0
+einops>=0.7.0
+click>=8.4.1
+pillow>=10.0.0
+pyyaml
+numpy
+tqdm
+huggingface_hub
+tensorboard
