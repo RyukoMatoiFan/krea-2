@@ -101,7 +101,12 @@ def main() -> None:
     cache_dir = cfg.paths.cache_dir
     os.makedirs(cache_dir, exist_ok=True)
 
-    images = sorted(glob.glob(os.path.join(img_dir, f"*.{cfg.data.img_ext}")))
+    # Recursive: large corpora arrive sharded across subdirectories, because a single folder
+    # holding the whole set is slow to list. A flat img_dir still matches, so this only widens
+    # what is accepted. `rel` below already carries the subdirectory into the cache name, so
+    # nested sources need nothing else.
+    images = sorted(glob.glob(os.path.join(img_dir, "**", f"*.{cfg.data.img_ext}"),
+                              recursive=True))
     if not images:
         raise SystemExit(f"no *.{cfg.data.img_ext} images under {img_dir}")
     if args.limit:
@@ -141,7 +146,7 @@ def main() -> None:
     vae = build_vae(cfg, device, dtype)
     encoder = build_encoder(cfg, device, dtype) if args.cache_text else None
 
-    done = skipped = 0
+    done = skipped = failed = 0
     for p in images:
         rel = os.path.relpath(p, img_dir)
         idx = manifest[rel]
@@ -176,7 +181,15 @@ def main() -> None:
             gh, gw = H // ALIGN, W // ALIGN
         except Exception as e:
             print(f"  WARN encode failed for {rel}: {type(e).__name__} {e}; skipping", flush=True)
-            skipped += 1
+            # Counted apart from `skipped`. A missing caption is a data property and expected in
+            # small numbers; an encode failure means the encoder stack is broken. One shared
+            # counter would let a run where every image failed still exit 0, leaving a cache
+            # holding a silently biased subset -- the worst outcome, because training proceeds.
+            failed += 1
+            if failed > max(10, 0.01 * (done + failed)):
+                raise SystemExit(
+                    f"aborting: {failed} encode failures against {done} cached "
+                    f"(last: {type(e).__name__} {e}) -- this is the encoder, not the data")
             continue
 
         payload = {"z_tgt": tokens, "grid_h": gh, "grid_w": gw, "idx": idx,
@@ -187,11 +200,11 @@ def main() -> None:
         atomic_save(payload, out)
         done += 1
         if done % 50 == 0:
-            print(f"  {done} cached ({skipped} skipped)", flush=True)
+            print(f"  {done} cached ({skipped} skipped, {failed} failed)", flush=True)
 
-    if done == 0 and skipped == 0:
+    if done == 0 and skipped == 0 and failed == 0:
         raise SystemExit("shard produced 0 caches -- check img_dir / captions")
-    print(f"DONE cached={done} skipped={skipped} -> {cache_dir}", flush=True)
+    print(f"DONE cached={done} skipped={skipped} failed={failed} -> {cache_dir}", flush=True)
 
 
 def atomic_save_json(obj, path: str) -> None:
