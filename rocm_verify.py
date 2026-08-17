@@ -90,8 +90,8 @@ def _attn_probe(masked: bool):
     """Run one attention fwd+bwd at production shapes and report peak memory and time.
 
     Memory is the criterion, not time. A fused kernel never materialises the score matrix; the math
-    fallback keeps one of B*H*L*L*2 bytes = 2.04 GB per call. That is a ~36x separation, far outside
-    any timing ambiguity.
+    fallback keeps one of B*H*L*L*2 bytes per call. The two states are separated by orders of
+    magnitude, far outside any timing ambiguity.
 
     Backward is included because it has separate backend eligibility -- a forward-only probe can
     pass while the training step falls back.
