@@ -456,6 +456,75 @@ def render_edit_previews(dit, vae, encoder, examples, out_path, *, res, steps, g
         torch.cuda.empty_cache()
 
 
+# Text length is rounded up to this multiple rather than trimmed exactly. An exact trim gives every
+# caption its own sequence length, which defeats the compiled path: the graph is recompiled per
+# shape and falls back to slower dynamic kernels. Bucketing keeps a handful of static shapes while
+# still dropping most of the padding.
+TEXT_LEN_BUCKET = 128
+
+
+def freeze_dit_prefix(dit, n_blocks):
+    """Freeze the first ``n_blocks`` transformer blocks and everything feeding them.
+
+    Opt-in and off by default: this changes *what is trained*, so it is a recipe decision, not a
+    free speedup. Enabling it makes the run no longer the full fine-tune it is costed as.
+
+    The stem must go with the blocks. Freezing ``blocks[0:k]`` alone saves nothing, because gradient
+    still has to flow *through* those blocks to reach a trainable ``first``/``tmlp``/``tproj``/
+    ``txtfusion``; the backward graph is only truncated when nothing below the cut needs a gradient.
+    Freezing the stem as well is what turns those blocks from 3-4 units of work into 1.
+
+    Returns (frozen_params, frozen_tensors) so the caller can report what it gave up.
+    """
+    stem = ("first", "posemb", "tmlp", "tproj", "txtfusion", "txtmlp")
+    frozen_p = frozen_t = 0
+    targets = []
+    for name in stem:
+        mod = getattr(dit, name, None)
+        if mod is not None:
+            targets.append(mod)
+    blocks = getattr(dit, "blocks", [])
+    targets.extend(blocks[: max(0, int(n_blocks))])
+    for mod in targets:
+        for p in mod.parameters():
+            if p.requires_grad:
+                p.requires_grad_(False)
+                frozen_p += p.numel()
+                frozen_t += 1
+    return frozen_p, frozen_t
+
+
+def trim_text_padding(ctx, mask, bucket=TEXT_LEN_BUCKET):
+    """Drop encoder padding from the conditioning before it reaches the DiT.
+
+    ``Qwen3VLConditioner`` tokenises with ``padding="max_length"``, so a 40-token caption still
+    arrives as ~541 text positions. Those positions cost real time twice over: the DiT carries them
+    through every block on top of 4096 image tokens, and — because a padded mask is never all-true —
+    ``SingleStreamDiT.forward`` can never take the maskless attention path that ``pad_to_multiple:
+    0`` exists to reach.
+
+    The padding is not a suffix. The encoder concatenates its template suffix *after* the padded
+    block, so the mask reads ``[valid ... PAD ... valid]`` and truncating to the valid count would
+    silently amputate the suffix. Compacting by gathering the valid positions keeps their order and
+    works for any batch size; at batch 1 it leaves an all-true mask, which is what re-engages the
+    unmasked kernel.
+
+    Returns the inputs untouched when there is nothing to remove, so the no-padding case costs one
+    reduction.
+    """
+    if mask is None or mask.ndim != 2 or not mask.numel():
+        return ctx, mask
+    keep = int(mask.sum(dim=1).max().item())
+    if bucket > 1:                                   # round up: few static shapes, not hundreds
+        keep = min(mask.shape[1], -(-keep // bucket) * bucket)
+    if keep >= mask.shape[1]:
+        return ctx, mask
+    # stable argsort on the negated mask: valid positions first, original order preserved.
+    idx = torch.argsort(~mask, dim=1, stable=True)[:, :keep]
+    gather_idx = idx.reshape(idx.shape + (1,) * (ctx.ndim - 2)).expand(-1, -1, *ctx.shape[2:])
+    return torch.gather(ctx, 1, gather_idx), torch.gather(mask, 1, idx)
+
+
 def slice_base_tiles(sheet_path, base_root, n):
     """Slice a base edit contact-sheet (``n`` example rows) into per-example BASE tiles
     ``idx0..n-1`` that the dashboard serves for its base-vs-current toggle. Stale tiles are
@@ -493,6 +562,11 @@ def main():
     output_dir, ckpt_dir = cfg.paths.output_dir, cfg.paths.ckpt_dir
     home_volume_guard(ckpt_dir)
     os.makedirs(output_dir, exist_ok=True)
+    # Create the checkpoint directory up front, not lazily on first write. save_ckpt() makes it
+    # itself, but save_best() probes free space with shutil.disk_usage(ckpt_dir) BEFORE calling it,
+    # which raises FileNotFoundError on a fresh run. That path opens only with keep_best > 0, where
+    # the failure would land at the first eval rather than at startup -- far into a paid run.
+    os.makedirs(ckpt_dir, exist_ok=True)
     cache_annotations, cache_annotations_digest = load_cache_annotations(
         cfg.data.cache_annotations)
 
@@ -661,6 +735,13 @@ def main():
             print(f"[preview] {tag} failed (non-fatal): {type(e).__name__} {e}", flush=True)
 
     # Param groups (separate LR for DiT vs TE).
+    if o.train_dit and o.freeze_prefix_blocks > 0:
+        fp, ft = freeze_dit_prefix(dit, o.freeze_prefix_blocks)
+        total = sum(p.numel() for p in dit.parameters())
+        print(f"[freeze] stem + first {o.freeze_prefix_blocks} blocks frozen: "
+              f"{ft} tensors, {fp/1e9:.2f}B of {total/1e9:.2f}B params "
+              f"({100*fp/max(1,total):.1f}%) — this is NOT a full fine-tune", flush=True)
+
     groups = []
     if o.train_dit:
         groups.append({"params": [p for p in dit.parameters() if p.requires_grad], "lr": o.lr, "name": "dit"})
@@ -681,7 +762,8 @@ def main():
                                 offload_states=o.offload_optimizer)
     sched_lr = build_lr_scheduler(opt, scheduler=o.lr_scheduler, warmup=o.warmup,
                                   total_steps=o.steps, min_lr_ratio=o.min_lr_ratio,
-                                  num_restarts=o.num_restarts)
+                                  num_restarts=o.num_restarts,
+                                  decay_frac=o.lr_decay_frac)
 
     # Positional group indices (order is fixed: dit first if trained, then te). Used for the
     # live-group lookup below and for reading te's LR at log time -- both robust to
@@ -787,6 +869,7 @@ def main():
                 ctx, mask = encode_text_with_ref_dropout(encoder, caps, vlm_imgs, ref_drop)
             else:
                 ctx, mask = encoder(caps, images=vlm_imgs)  # (B,L,12,2560), (B,L); images=None -> text-only
+            ctx, mask = trim_text_padding(ctx, mask)
             ctx = ctx.to(device)
             mask = mask.to(device)
         else:
@@ -824,9 +907,29 @@ def main():
         return (z0, ctx, mask, gh, gw, refs, ref_grids, ref_drop, delta_mask_flags,
                 ref_geometry == "fit")
 
+    # Optional lower-resolution pool. Off unless optim.mixed_res_prob > 0 AND a second cache is
+    # given: a low-res step is cheaper because cost scales with token count, but whether a low-res
+    # exposure teaches as much as a full-res one is unproven for this model, so it stays opt-in.
+    lowres_by_bucket = lowres_keys = lowres_weights = None
+    if o.mixed_res_prob > 0.0:
+        if not cfg.data.mixed_res_cache_dir:
+            raise SystemExit("optim.mixed_res_prob > 0 requires data.mixed_res_cache_dir "
+                             "(a cache precached at the lower resolution)")
+        lowres_by_bucket, _ = index_caches(cfg.data.mixed_res_cache_dir, 0, train_list="")
+        lowres_keys = list(lowres_by_bucket)
+        lowres_weights = [len(lowres_by_bucket[k]) for k in lowres_keys]
+        if not lowres_keys:
+            raise SystemExit(f"no caches found in {cfg.data.mixed_res_cache_dir}")
+        print(f"[mixed-res] {sum(lowres_weights)} low-res caches, drawn {o.mixed_res_prob:.0%} "
+              f"of steps, buckets={lowres_keys}", flush=True)
+
     def sample_batch():
-        key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
-        files = train_by_bucket[key]
+        if lowres_keys is not None and rng.random() < o.mixed_res_prob:
+            key = rng.choices(lowres_keys, weights=lowres_weights, k=1)[0]
+            files = lowres_by_bucket[key]
+        else:
+            key = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
+            files = train_by_bucket[key]
         return collate([rng.choice(files) for _ in range(o.batch)],
                        drop_refs=True, augment_order=True)
 

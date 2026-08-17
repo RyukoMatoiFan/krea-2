@@ -110,6 +110,12 @@ class DataConfig:
   fit_ref_crop_tolerance: float = 0.08  # fit mode: near-matching ARs within this fraction fill target
   train_list: str = ""             # JSON list of cache filenames (repeats = oversampling)
   eval_list: str = ""              # JSON list of held-out cache filenames (else idx < n_eval_holdout)
+  mixed_res_cache_dir: str = ""    # optional second cache precached at a LOWER resolution;
+                                   # used only when optim.mixed_res_prob > 0. Keep it a
+                                   # separate directory: precache records only img_dir in
+                                   # precache_source.json, not resolution, so a second pass
+                                   # into the same cache_dir would silently skip every image
+                                   # as already-done and produce nothing.
   cache_annotations: str = ""      # optional JSON map: filename -> neutral training annotations
   aspect_bucketing: bool = False   # precache at nearest-AR bucket instead of square-squash
   bucket_pixels: int = 0           # target area for buckets; 0 -> resolution^2
@@ -140,9 +146,22 @@ class OptimConfig:
   ema_decay: float = 0.999
   ema_every: int = 10              # stride for the (CPU) EMA host-copy; decay is compounded as decay**every
   nan_guard: bool = True           # skip the optimizer step on a non-finite loss
-  lr_scheduler: str = "cosine"     # cosine | constant | linear | cosine_restarts
+  lr_scheduler: str = "cosine"     # cosine | constant | linear | cosine_restarts | wsd
+  lr_decay_frac: float = 0.1       # wsd only: fraction of the run spent annealing. The rest
+                                   # is flat, so any point in it is a valid place to stop and
+                                   # decay -- which is what makes an early-stop signal usable
   min_lr_ratio: float = 0.1        # LR floor (fraction of base) the decay approaches
   num_restarts: int = 1            # cycles for cosine_restarts
+  # --- opt-in recipe changes: OFF by default because they change what is trained ---
+  freeze_prefix_blocks: int = 0    # >0 freezes the stem + first N DiT blocks. Cuts step time
+                                   # (frozen blocks build no backward graph) but the result is
+                                   # no longer a full fine-tune. The stem is frozen with them:
+                                   # leaving it trainable means gradient still flows through
+                                   # the frozen blocks to reach it, saving nothing.
+  mixed_res_prob: float = 0.0      # >0 draws that fraction of steps from a lower-resolution
+                                   # cache (data.mixed_res_cache_dir). Cheaper per step, but
+                                   # whether a low-res exposure is worth a full-res one is
+                                   # unproven for this model -- measure before trusting it.
   offload_optimizer: bool = False  # full-FT: keep Adam moments in CPU RAM (lower VRAM, host-RAM cost)
   blocks_to_swap: int = 0          # page N deepest blocks CPU<->GPU per fwd/bwd (LoRA: frozen base only; full-FT pages all, slower)
   quantize_base: str = ""          # LoRA: "" off | "fp8" (e4m3 storage, dequantized per forward)
@@ -426,7 +445,14 @@ def load_config(path: str | None = None) -> TrainConfig:
 
 
 def set_tf32(enabled: bool) -> None:
-  """Toggle TF32 for matmul + cuDNN."""
+  """Request TF32 for matmul + cuDNN.
+
+  A request, not a guarantee: TF32 is an NVIDIA Ampere+ datapath and simply does not exist
+  elsewhere, so on ROCm these flags are accepted and ignored. Harmless here because the model
+  runs bf16 end to end and the remaining fp32 work is elementwise -- but the run manifest
+  records the RESOLVED precision rather than this request, so the two platforms are not
+  silently reported as having used the same numerics.
+  """
   import torch
 
   torch.backends.cuda.matmul.allow_tf32 = enabled
@@ -448,6 +474,17 @@ def apply_runtime(cfg: TrainConfig) -> None:
 
   if cfg.runtime.tf32:
     set_tf32(True)
+
+  # Fail here rather than 40 lines deeper. The lockfile pins a CUDA wheel, so installing on a
+  # non-NVIDIA host yields a torch whose is_available() is False; the code then degrades
+  # quietly -- GPU RNG is dropped from the resume blob, peak-memory stats are skipped -- and
+  # dies later with a message that points at the wrong thing.
+  import torch
+  if cfg.runtime.device.startswith("cuda") and not torch.cuda.is_available():
+    raise RuntimeError(
+      f"runtime.device={cfg.runtime.device} but no GPU backend is available "
+      f"(torch {torch.__version__}, cuda={torch.version.cuda}, hip={torch.version.hip}). "
+      "On ROCm install a rocm wheel; the locked default index targets CUDA.")
 
   # The default training path disables Dynamo because varying training/preview shapes can exhaust
   # its recompile cache. Explicit per-block compilation owns that tradeoff and enables Dynamo.

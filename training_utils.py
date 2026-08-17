@@ -220,15 +220,32 @@ def build_lr_scheduler(
   total_steps: int = 1,
   num_restarts: int = 1,
   min_lr_ratio: float = 0.0,
+  decay_frac: float = 0.1,
 ):
   """LambdaLR with a linear warmup followed by the chosen decay.
 
-  scheduler: cosine | constant | linear | cosine_restarts. `min_lr_ratio` is the
+  scheduler: cosine | constant | linear | cosine_restarts | wsd. `min_lr_ratio` is the
   floor (fraction of base LR) the decays approach.
+
+  ``wsd`` (warmup-stable-decay) holds the LR flat and anneals only over the last ``decay_frac`` of
+  the run. Cosine ties the whole schedule to ``total_steps``: stopping a cosine run early leaves the
+  weights un-annealed (at 60% of a cosine run the LR is still ~0.69 of base), so an early-stop
+  signal is unusable — the checkpoint you stop on is not the checkpoint you would have shipped.
+  Under WSD any point in the stable phase is a legitimate place to start the decay, which is what
+  makes "stop when the eval curve flattens" an actionable rule rather than a wasted observation.
   """
   def fn(step: int) -> float:
     if warmup and step < warmup:
       return step / max(1, warmup)
+    if scheduler == "wsd":
+      frac = min(max(decay_frac, 0.0), 1.0)
+      decay_start = total_steps - int(round(frac * max(0, total_steps - warmup)))
+      if step < decay_start:
+        return 1.0
+      p = (step - decay_start) / max(1, total_steps - decay_start)
+      p = min(max(p, 0.0), 1.0)
+      # cosine shape over the decay window only
+      return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * p))
     progress = (step - warmup) / max(1, total_steps - warmup)
     progress = min(max(progress, 0.0), 1.0)
     if scheduler == "constant":
